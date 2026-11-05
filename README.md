@@ -1,3 +1,5 @@
+<p align="center"><img src="docs/images/logo.svg" width="140" alt="Logo ADAdminGuard : un bouclier qui protège un groupe de comptes, dont un est refusé"></p>
+
 # ADAdminGuard
 
 Garde-fou pour les groupes à privilèges d'Active Directory. Seuls les comptes d'une **liste blanche** (et le compte

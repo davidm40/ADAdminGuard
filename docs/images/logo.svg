@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 120 120" width="120" height="120" role="img" aria-label="ADAdminGuard">
+  <title>ADAdminGuard</title>
+  <path d="M15 20 L60 8 L105 20 V62 C105 92 82 108 60 116 C38 108 15 92 15 62 Z" fill="#1f3a5f"/>
+  <circle cx="42" cy="50" r="7" fill="#ffffff"/>
+  <circle cx="60" cy="44" r="8" fill="#ffffff"/>
+  <circle cx="78" cy="50" r="7" fill="#ffffff"/>
+  <path d="M30 76 C30 64 54 64 54 76 Z" fill="#ffffff"/>
+  <path d="M46 72 C46 58 74 58 74 72 Z" fill="#ffffff"/>
+  <path d="M66 76 C66 64 90 64 90 76 Z" fill="#ffffff"/>
+  <circle cx="88" cy="94" r="15" fill="#d9822b"/>
+  <line x1="82" y1="88" x2="94" y2="100" stroke="#ffffff" stroke-width="4" stroke-linecap="round"/>
+  <line x1="94" y1="88" x2="82" y2="100" stroke="#ffffff" stroke-width="4" stroke-linecap="round"/>
+</svg>
