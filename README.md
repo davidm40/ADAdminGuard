@@ -489,3 +489,8 @@ d'information ne sont pas envoyés et `state.json` n'est pas mis à jour.
 | `logs\` | Journaux quotidiens (non versionnés). |
 
 Tous les scripts sont compatibles Windows PowerShell 5.1 et encodés en UTF-8 avec BOM.
+
+---
+
+<p align="center">Si ADAdminGuard vous rend service, vous pouvez m'offrir un café :</p>
+<p align="center"><a href="https://ko-fi.com/code4human"><img src="https://ko-fi.com/img/githubbutton_sm.svg" alt="Soutenir sur Ko-fi"></a></p>
