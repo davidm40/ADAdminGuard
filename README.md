@@ -52,6 +52,20 @@ La tâche planifiée `ADAdminGuard` s'exécute en **SYSTEM** sur chaque contrôl
 Tout ajout à un groupe global ou universel déclenche le contrôle, y compris l'ajout à un groupe imbriqué dans un
 groupe surveillé.
 
+Dans le Planificateur de tâches, le contrôle horaire apparaît comme un déclencheur **« Une fois »** à la date
+d'installation, avec **« Après le déclenchement, recommencer toutes les 1 heure »** : il se répète sans fin. Il
+rattrape ce que le déclencheur par événement ne voit pas, puisque l'événement 4728 / 4756 n'est écrit que sur le DC
+qui a traité l'ajout :
+
+- ajout traité par un autre DC, sur lequel la tâche n'a pas tourné ;
+- DC ou service de tâches arrêté au moment de l'ajout ;
+- audit désactivé, par erreur ou volontairement ;
+- compte revenu dans un groupe sans ajout classique (restauration depuis la corbeille AD ou une sauvegarde).
+
+Il met aussi à jour `state.json` et détecte une modification de la liste blanche même sans ajout à un groupe.
+Ne pas le supprimer : sans lui, une seule défaillance du déclencheur par événement laisserait un compte non
+autorisé en place indéfiniment.
+
 ### Règle
 
 Les groupes surveillés sont identifiés par leur **SID** (RID 512, 519 et 518), pas par leur nom : le contrôle
@@ -101,6 +115,18 @@ Le mode est choisi à l'installation de la tâche, enregistré dans `config.json
 Les mails d'information sont envoyés par le DC concerné : celui dont la liste blanche a changé, ou celui qui a
 traité l'ajout (l'événement 4728 / 4756 n'est écrit que sur ce DC). Au **premier passage** après l'installation,
 le contrôle enregistre un état de référence sans envoyer de mail d'information.
+
+**Alerte de quarantaine** (ici en mode simulation) :
+
+![Mail d'alerte de quarantaine](docs/images/mail-alerte.png)
+
+**Information : liste blanche modifiée** :
+
+![Mail d'information : liste blanche modifiée](docs/images/mail-liste-blanche-modifiee.png)
+
+**Information : ajout autorisé** :
+
+![Mail d'information : ajout autorisé](docs/images/mail-ajout-autorise.png)
 
 ### Auteur de l'ajout
 
@@ -177,6 +203,8 @@ l'étape 1 n'est pas faite**. **Enregistrer** écrit `config.json` et `whitelist
 Par sécurité, le contrôle **refuse de s'exécuter tant que `whitelist.txt` n'existe pas**.
 Terminée quand au moins un groupe est coché et la liste n'est pas vide.
 
+![Étape 1 : liste blanche](docs/images/etape1-liste-blanche.png)
+
 ### Étape 2 : message
 
 Texte de sensibilisation affiché en tête de l'alerte de quarantaine. Quatre modèles sont proposés : *Rappel de la
@@ -186,6 +214,8 @@ aussitôt ; *Aucun message* supprime l'encadré ; toute modification à la main 
 
 Les modèles affirment que les comptes « ont été désactivés » : en simulation prolongée, adapter le texte (le mail
 précise de toute façon qu'aucune modification n'a été faite). Les mails d'information ont un texte fixe.
+
+![Étape 2 : message de sensibilisation](docs/images/etape2-message.png)
 
 ### Étape 3 : notification
 
@@ -215,6 +245,10 @@ valeur pour les remplacer. **Envoyer un mail de test** envoie un mail avec le me
 En cas d'échec, le message affiche la cause : motif Entra ID / Graph (`AADSTS…`, permission manquante…) ou
 erreur du serveur SMTP. Terminée quand les champs de la méthode choisie sont remplis.
 
+| Microsoft 365 (Graph) | Serveur SMTP |
+|---|---|
+| ![Étape 3 : notification par Microsoft 365](docs/images/etape3-notification.png) | ![Étape 3 : notification par SMTP](docs/images/etape3-notification-smtp.png) |
+
 ### Étape 4 : planification
 
 | Élément | Effet |
@@ -230,6 +264,12 @@ erreur du serveur SMTP. Terminée quand les champs de la méthode choisie sont r
 
 L'étape affiche aussi l'état de la tâche, le mode enregistré et l'état de l'audit. Terminée quand la tâche est
 installée.
+
+![Étape 4 : planification](docs/images/etape4-planification.png)
+
+À l'installation, le mode est choisi explicitement ; **Entrée** choisit Simulation, le choix sans risque :
+
+![Choix du mode d'installation](docs/images/choix-du-mode.png)
 
 ### Fichiers `config.json` et `whitelist.txt`
 
