@@ -480,6 +480,7 @@ d'information ne sont pas envoyés et `state.json` n'est pas mis à jour.
 | `Show-ADAdminGuardConfig.ps1` | Configurateur graphique en quatre étapes. |
 | `Invoke-ADAdminGuard.ps1` | Contrôle, exécuté par la tâche planifiée. |
 | `ADAdminGuard.psm1` | Fonctions communes : configuration, liste blanche, état, export / import, secrets, envoi Graph et SMTP, AD, tâche planifiée. |
+| `ADAdminGuard.ico` | Icône du configurateur (facultative). |
 | `config.json` | Configuration, créée par le configurateur (non versionnée). |
 | `whitelist.txt` | Liste blanche, créée par le configurateur (non versionnée). |
 | `state.json` | État entre deux exécutions (non versionné). |
