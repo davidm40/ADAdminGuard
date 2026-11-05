@@ -2,33 +2,38 @@
 #Requires -Modules ActiveDirectory
 <#
 .SYNOPSIS
-    Met en quarantaine les comptes hors pattern et hors liste blanche ajoutés aux groupes Admins du domaine, de l'entreprise ou du schéma.
+    Met en quarantaine les comptes hors liste blanche ajoutés aux groupes Admins du domaine, de l'entreprise ou du schéma.
 .DESCRIPTION
     Lancé par la tâche planifiée « ADAdminGuard » (événements 4728/4756 du journal Sécurité, et toutes les heures).
     Les groupes surveillés (config.json) sont parcourus avec leurs groupes imbriqués, à tous les niveaux.
-    Un compte direct ou indirect est ignoré s'il :
-      - figure dans whitelist.txt,
-      - respecte le pattern (expression régulière, insensible à la casse),
-      - est l'Administrateur intégré (RID 500).
+    Seuls y sont admis l'Administrateur intégré (RID 500) et les comptes de whitelist.txt, reconnus par leur SID.
     Le contrôle porte sur tout le domaine, quel que soit l'emplacement du compte.
-    Sinon, pour un compte utilisateur : retrait du groupe qui le contient directement (le groupe surveillé ou le
-    groupe imbriqué), désactivation, description horodatée, déplacement dans l'OU de quarantaine.
+    Un compte utilisateur non autorisé est retiré du groupe qui le contient directement (le groupe surveillé ou le
+    groupe imbriqué), désactivé, annoté d'une description horodatée et déplacé dans l'OU de quarantaine.
     Un groupe imbriqué présent dans whitelist.txt est autorisé, mais ses membres restent contrôlés un par un ;
     absent de la liste, il est signalé. Ordinateurs, gMSA et objets non résolus hors liste sont seulement signalés.
-    Un mail récapitulatif est envoyé (Microsoft Graph ou SMTP, selon config.json) et chaque détection est inscrite dans le journal
-    Application (source ADAdminGuard, ID 1000 = quarantaine, 1001 = détection sans action, 1002 = erreur).
-    En mode simulation (config.json) ou avec -WhatIf, rien n'est modifié dans l'AD ; le mail est tout de même envoyé.
+
+    Trois mails (Microsoft Graph ou SMTP, selon config.json) :
+      - alerte de quarantaine, avec le message de sensibilisation choisi dans le configurateur ;
+      - information « liste blanche modifiée » : comptes ajoutés ou retirés de whitelist.txt sur ce DC depuis
+        l'exécution précédente ;
+      - information « ajout autorisé » : un compte de la liste blanche (ou l'Administrateur intégré) a été ajouté à
+        un groupe surveillé ou à un groupe imbriqué, d'après les événements 4728/4756 de ce DC.
+    Journal Application, source ADAdminGuard : 1000 quarantaine, 1001 détection sans action, 1002 erreur,
+    1003 liste blanche modifiée, 1004 ajout autorisé.
+    En mode simulation (config.json) ou avec -WhatIf, rien n'est modifié dans l'AD ; l'alerte est tout de même envoyée.
+    Avec -WhatIf, les mails d'information ne sont pas envoyés et state.json n'est pas mis à jour.
     Refuse de s'exécuter si whitelist.txt n'existe pas, pour ne pas mettre en quarantaine les administrateurs en place.
 .PARAMETER EventLookbackMinutes
-    Fenêtre de recherche des événements 4728/4756 servant à retrouver l'auteur de l'ajout. 120 par défaut.
+    Fenêtre de lecture des événements 4728/4756 (auteur des ajouts, traçabilité). 120 par défaut.
 .PARAMETER LogDir
     Dossier des journaux (un fichier par jour, purge après 90 jours). Par défaut : sous-dossier logs du script.
 .EXAMPLE
     .\Invoke-ADAdminGuard.ps1 -WhatIf
-    Contrôle sans rien modifier, affiche ce qui serait fait et envoie le mail.
+    Contrôle sans rien modifier, affiche ce qui serait fait et envoie l'alerte s'il y a lieu.
 .NOTES
     Configuration : Show-ADAdminGuardConfig.ps1, à lancer sur chaque contrôleur de domaine.
-    Version : 1.0 (2026-11-05) - création
+    Version : 2.0 (2026-11-05) - liste blanche seule (par SID), mails d'information
 #>
 [CmdletBinding(SupportsShouldProcess)]
 param(
@@ -97,15 +102,21 @@ function Invoke-GuardAction {
     }
 }
 
+function ConvertTo-HtmlCell {
+    param($Value)
+    [Net.WebUtility]::HtmlEncode([string]$Value) -replace "`n", '<br>'
+}
+
 function New-MailBody {
+    # Mail d'alerte de quarantaine : message de sensibilisation (orange) + tableau des comptes
     param([Parameter(Mandatory)][object[]]$Finding, [Parameter(Mandatory)][string]$Intro, [string]$Message)
-    $enc = { param($s) [Net.WebUtility]::HtmlEncode([string]$s) -replace "`n", '<br>' }
     $banner = ConvertTo-AdagMailBanner -Message $Message
     $td = 'style="border:1px solid #ccc;padding:6px;vertical-align:top"'
     $th = 'style="border:1px solid #ccc;padding:6px;background:#f2f2f2;text-align:left"'
     $rows = foreach ($f in $Finding) {
         "<tr><td $td><b>{0}</b><br><small>{1}</small></td><td $td>{2}</td><td $td>{3}<br><small>{4}</small></td><td $td>{5}</td></tr>" -f `
-            (& $enc $f.Compte), (& $enc $f.DN), (& $enc $f.Groupes), (& $enc $f.AjoutePar), (& $enc $f.AjouteLe), (& $enc $f.Actions)
+            (ConvertTo-HtmlCell $f.Compte), (ConvertTo-HtmlCell $f.DN), (ConvertTo-HtmlCell $f.Groupes),
+            (ConvertTo-HtmlCell $f.AjoutePar), (ConvertTo-HtmlCell $f.AjouteLe), (ConvertTo-HtmlCell $f.Actions)
     }
     @"
 <html><body style="font-family:Segoe UI,Arial,sans-serif;font-size:14px">
@@ -115,10 +126,54 @@ $banner
 <tr><th $th>Compte</th><th $th>Appartenance</th><th $th>Ajouté par</th><th $th>Actions</th></tr>
 $($rows -join "`n")
 </table>
-<p style="color:#666;font-size:12px">Si l'ajout est légitime : renommez le compte selon le pattern ou ajoutez-le à la liste blanche
-(Show-ADAdminGuardConfig.ps1), puis réactivez-le et remettez-le dans le groupe dont il a été retiré.</p>
+<p style="color:#666;font-size:12px">Si l'ajout est légitime : ajoutez le compte à la liste blanche (Show-ADAdminGuardConfig.ps1,
+sur chaque contrôleur de domaine), puis réactivez-le et remettez-le dans le groupe dont il a été retiré.</p>
 </body></html>
 "@
+}
+
+function New-InfoMailBody {
+    # Mail d'information (bandeau bleu, aucune action) : titre, phrase d'introduction, tableau libre
+    param([Parameter(Mandatory)][string]$Title, [Parameter(Mandatory)][string]$Intro,
+        [Parameter(Mandatory)][string[]]$Header, [Parameter(Mandatory)][object[]]$Row)
+    $td = 'style="border:1px solid #ccc;padding:6px;vertical-align:top"'
+    $th = 'style="border:1px solid #ccc;padding:6px;background:#f2f2f2;text-align:left"'
+    $head = ($Header | ForEach-Object { "<th $th>$(ConvertTo-HtmlCell $_)</th>" }) -join ''
+    $rows = foreach ($r in $Row) { '<tr>' + (($r | ForEach-Object { "<td $td>$(ConvertTo-HtmlCell $_)</td>" }) -join '') + '</tr>' }
+    @"
+<html><body style="font-family:Segoe UI,Arial,sans-serif;font-size:14px">
+<div style="border-left:4px solid #2b6cb0;background:#ebf4fb;padding:10px 14px;margin:0 0 14px 0"><b>$(ConvertTo-HtmlCell $Title)</b><br>
+Message d'information pour traçabilité : aucune action n'a été effectuée sur les comptes.</div>
+<p>$Intro</p>
+<table style="border-collapse:collapse"><tr>$head</tr>
+$($rows -join "`n")
+</table>
+</body></html>
+"@
+}
+
+function Send-Notification {
+    # Envoi avec journalisation ; un échec est consigné sans interrompre le contrôle
+    param([Parameter(Mandatory)][string]$Subject, [Parameter(Mandatory)][string]$HtmlBody)
+    if (-not (Test-AdagMailConfigured -Config $cfg)) {
+        Write-Log "Notification mail non configurée : « $Subject » non envoyé" 'WARN'
+        return
+    }
+    try {
+        Send-AdagMail -Config $cfg -Subject $Subject -HtmlBody $HtmlBody
+        Write-Log "Mail « $Subject » envoyé à $($cfg.Mail.To)"
+    }
+    catch {
+        Write-Log "Échec de l'envoi du mail « $Subject » : $($_.Exception.Message)" 'ERROR'
+        Write-GuardEvent -EventId 1002 -EntryType Error -Message "Échec de l'envoi du mail « $Subject » : $($_.Exception.Message)"
+        $script:HasError = $true
+    }
+}
+
+function Get-WhitelistKey {
+    # Clé de comparaison d'une entrée : le SID, ou le nom pour une entrée sans SID
+    param([Parameter(Mandatory)] $Entry)
+    if ($Entry.Sid) { [string]$Entry.Sid } else { "nom:$($Entry.Name.ToLowerInvariant())" }
 }
 
 New-Item -ItemType Directory -Path $LogDir -Force -WhatIf:$false | Out-Null
@@ -142,35 +197,38 @@ try {
     $simulation = [bool]$cfg.SimulationMode
     $script:Simulation = $simulation
     $domainName = (Get-ADDomain).DNSRoot
-    Write-Log ("Pattern '{0}', {1} compte(s) en liste blanche, mode {2}" -f $cfg.Pattern, $whitelist.Count,
-        $(if ($simulation) { 'simulation' } else { 'application' }))
+    $state      = Get-AdagState
+    Write-Log ("{0} compte(s) en liste blanche, mode {1}" -f $whitelist.Count, $(if ($simulation) { 'simulation' } else { 'application' }))
+    $noSid = @($whitelist | Where-Object { -not $_.Sid })
+    if ($noSid.Count) {
+        Write-Log ("Entrée(s) de liste blanche sans SID, comparées sur le nom seul : {0}. Réenregistrez la liste dans le configurateur pour y ajouter le SID." -f
+            (($noSid | Select-Object -ExpandProperty Name) -join ', ')) 'WARN'
+    }
 
     $audit = Get-AdagAuditState
     if ($audit.Enabled -ne $true) {
         Write-Log "Audit « Gestion des groupes de sécurité » : $($audit.Text). Sans succès audité, pas de déclenchement immédiat ni d'auteur de l'ajout." 'WARN'
     }
 
+    $eventsRead = $true
     try {
         $events = @(Get-AdagAddEvent -Minutes $EventLookbackMinutes)
         Write-Log "$($events.Count) ajout(s) à un groupe (4728/4756) dans le journal Sécurité sur les $EventLookbackMinutes dernières minutes"
     }
     catch {
         $events = @()
+        $eventsRead = $false
         Write-Log $_.Exception.Message 'WARN'
     }
 
-    # 1. Membres non conformes, directs et imbriqués, groupe surveillé par groupe surveillé
+    # 1. Membres directs et imbriqués de chaque groupe surveillé ; les non autorisés sont retenus
+    $allEntries = New-Object System.Collections.Generic.List[object]
     $hits = New-Object System.Collections.Generic.List[object]
     foreach ($gi in @(Get-AdagGroup -Key $cfg.Groups)) {
         foreach ($e in @(Get-AdagEffectiveMember -GroupInfo $gi)) {
-            $m = $e.Member
-            $label = if ($m.SamAccountName) { $m.SamAccountName } else { $m.DistinguishedName }
-            if ($m.Sid -like '*-500') { continue }
-            if ($m.SamAccountName -and $whitelist -contains $m.SamAccountName) { continue }
+            $allEntries.Add($e)
             # Un groupe imbriqué n'est jugé que sur la liste blanche ; ses membres sont contrôlés de toute façon
-            if ($m.ObjectClass -ne 'group' -and $m.SamAccountName -and
-                [regex]::IsMatch($m.SamAccountName, $cfg.Pattern, 'IgnoreCase')) { continue }
-            $hits.Add($e)
+            if (-not (Test-AdagAuthorized -Member $e.Member -Whitelist $whitelist)) { $hits.Add($e) }
         }
     }
 
@@ -179,7 +237,7 @@ try {
         $m          = $entry.Group[0].Member
         $label      = if ($m.SamAccountName) { $m.SamAccountName } else { $m.DistinguishedName }
         $parents    = @($entry.Group | Sort-Object -Property ParentDN -Unique)
-        # Un chemin par ligne, ex. « Administrateurs de l'entreprise (Enterprise Admins) > G-S-T0-Managers > toto »
+        # Un chemin par ligne, ex. « Administrateurs de l'entreprise (Enterprise Admins) > G-Tier0-Admins > toto »
         # Select-Object et non ForEach-Object -MemberName : ce dernier respecte -WhatIf et ne renverrait rien
         $groupNames = (@($entry.Group | Select-Object -ExpandProperty Path | Sort-Object -Unique) | ForEach-Object { "$_ > $label" }) -join "`n"
         $actions    = New-Object System.Collections.Generic.List[string]
@@ -222,7 +280,7 @@ try {
             $addedBy = 'inconnu'
             $addedOn = "date d'ajout introuvable"
         }
-        Write-Log "$label non conforme : $($groupNames -replace "`n", ' | ')" 'WARN'
+        Write-Log "$label non autorisé : $($groupNames -replace "`n", ' | ')" 'WARN'
 
         if ($m.ObjectClass -eq 'group') {
             $actions.Add('Groupe imbriqué absent de la liste blanche : ses membres sont contrôlés, le groupe lui-même est à vérifier manuellement')
@@ -242,7 +300,7 @@ try {
             Invoke-GuardAction -Cmdlet $PSCmdlet -ActionList $actions -Target $label -Description 'Désactivation du compte' -Action {
                 Disable-ADAccount -Identity $m.DistinguishedName -Server $server -Confirm:$false
             }
-            $desc = '[ADAdminGuard {0:yyyy-MM-dd HH:mm}] Quarantaine : compte à privilèges hors pattern et hors liste blanche' -f (Get-Date)
+            $desc = '[ADAdminGuard {0:yyyy-MM-dd HH:mm}] Quarantaine : compte à privilèges hors liste blanche' -f (Get-Date)
             if ($m.Description) { $desc = "$desc | $($m.Description)" }
             if ($desc.Length -gt 1024) { $desc = $desc.Substring(0, 1024) }
             Invoke-GuardAction -Cmdlet $PSCmdlet -ActionList $actions -Target $label -Description 'Description horodatée' -Action {
@@ -265,7 +323,7 @@ try {
 
         $actioned = -not $simulation -and $m.ObjectClass -in @('user', 'inetOrgPerson') -and -not $WhatIfPreference
         Write-GuardEvent -EventId $(if ($actioned) { 1000 } else { 1001 }) -EntryType Warning `
-            -Message ("Membre non conforme d'un groupe à privilèges : {0} ({1})`r`nAppartenance :`r`n{2}`r`nActions :`r`n{3}" -f `
+            -Message ("Membre non autorisé d'un groupe à privilèges : {0} ({1})`r`nAppartenance :`r`n{2}`r`nActions :`r`n{3}" -f `
                 $label, $m.DistinguishedName, ($groupNames -replace "`n", "`r`n"), ($actions -join "`r`n"))
 
         [pscustomobject]@{
@@ -278,31 +336,81 @@ try {
         }
     })
 
-    # 3. Notification
+    # 3. Alerte de quarantaine
     if ($findings.Count -eq 0) {
-        Write-Log 'Aucun compte non conforme'
+        Write-Log 'Aucun compte non autorisé'
     }
     else {
         $prefix = if ($simulation) { '[SIMULATION] ' } elseif ($WhatIfPreference) { '[WHATIF] ' } else { '' }
-        $subject = '{0}[ADAdminGuard] {1} compte(s) à privilèges non autorisé(s) - {2}' -f $prefix, $findings.Count, $domainName
-        # Le pattern n'est jamais écrit dans le mail : il ne doit pas circuler hors des contrôleurs de domaine
         $intro = 'Contrôle exécuté sur <b>{0}</b> le {1:dd/MM/yyyy à HH:mm}.' -f $env:COMPUTERNAME, (Get-Date)
         if ($simulation) { $intro += '<br><b>Mode simulation : aucune modification n''a été faite dans l''AD.</b>' }
+        Send-Notification -Subject ('{0}[ADAdminGuard] {1} compte(s) à privilèges non autorisé(s) - {2}' -f $prefix, $findings.Count, $domainName) `
+            -HtmlBody (New-MailBody -Finding $findings -Intro $intro -Message ([string]$cfg.MailMessage))
+    }
 
-        if (Test-AdagMailConfigured -Config $cfg) {
-            try {
-                Send-AdagMail -Config $cfg -Subject $subject -HtmlBody (New-MailBody -Finding $findings -Intro $intro -Message ([string]$cfg.MailMessage))
-                Write-Log "Mail envoyé à $($cfg.Mail.To)"
-            }
-            catch {
-                Write-Log "Échec de l'envoi du mail : $($_.Exception.Message)" 'ERROR'
-                Write-GuardEvent -EventId 1002 -EntryType Error -Message "Échec de l'envoi du mail : $($_.Exception.Message)"
-                $script:HasError = $true
+    # 4. Information : liste blanche modifiée sur ce DC depuis l'exécution précédente
+    $currentKeys = @{}
+    foreach ($w in $whitelist) { $currentKeys[(Get-WhitelistKey -Entry $w)] = $w }
+    if ($state) {
+        $previous = @{}
+        foreach ($w in @($state.Whitelist)) { $previous[(Get-WhitelistKey -Entry $w)] = $w }
+        $added   = @($currentKeys.Keys | Where-Object { -not $previous.ContainsKey($_) } | ForEach-Object { $currentKeys[$_] })
+        $removed = @($previous.Keys | Where-Object { -not $currentKeys.ContainsKey($_) } | ForEach-Object { $previous[$_] })
+        if ($added.Count -or $removed.Count) {
+            $changes = @(
+                $added   | ForEach-Object { , @('Ajouté', $_.Name, $_.Sid) }
+                $removed | ForEach-Object { , @('Retiré', $_.Name, $_.Sid) }
+            )
+            $summary = ($changes | ForEach-Object { "$($_[0]) : $($_[1])" }) -join ', '
+            Write-Log "Liste blanche modifiée sur $env:COMPUTERNAME : $summary" 'WARN'
+            if ($WhatIfPreference) { Write-Log 'WhatIf : mail « liste blanche modifiée » non envoyé' }
+            else {
+                Write-GuardEvent -EventId 1003 -EntryType Information -Message "Liste blanche modifiée sur $env:COMPUTERNAME : $summary"
+                $intro = ("Le fichier whitelist.txt de <b>{0}</b> a changé depuis le contrôle précédent (constaté le {1:dd/MM/yyyy à HH:mm}). " +
+                    "Les comptes ajoutés peuvent désormais être membres des groupes d'administration sans être mis en quarantaine. " +
+                    "Vérifiez que la modification est prévue et qu'elle a été reportée sur les autres contrôleurs de domaine.") -f $env:COMPUTERNAME, (Get-Date)
+                Send-Notification -Subject "[ADAdminGuard] Information : liste blanche modifiée sur $env:COMPUTERNAME - $domainName" `
+                    -HtmlBody (New-InfoMailBody -Title 'Liste blanche modifiée' -Intro $intro -Header @('Modification', 'Compte', 'SID') -Row $changes)
             }
         }
-        else {
-            Write-Log 'Notification mail non configurée : aucun mail envoyé' 'WARN'
+    }
+
+    # 5. Information : ajouts autorisés à un groupe surveillé ou imbriqué, d'après les événements de ce DC
+    $lastRecord = if ($state -and $state.PSObject.Properties['LastEventRecordId']) { [long]$state.LastEventRecordId } else { -1 }
+    $maxRecord = $lastRecord
+    if ($events.Count) { $maxRecord = [math]::Max($lastRecord, [long](($events | Measure-Object -Property RecordId -Maximum).Maximum)) }
+    if ($state -and $eventsRead) {
+        $privilegedGroups = @{}
+        foreach ($e in $allEntries) { if ($e.ParentSid) { $privilegedGroups[$e.ParentSid] = $true } }
+        $traces = @(foreach ($ev in @($events | Where-Object { $_.RecordId -gt $lastRecord -and $privilegedGroups.ContainsKey($_.GroupSid) } | Sort-Object -Property Time)) {
+            $entry = $allEntries | Where-Object { $_.Member.Sid -eq $ev.MemberSid -and $_.ParentSid -eq $ev.GroupSid } | Select-Object -First 1
+            # Ajout non autorisé : déjà traité par l'alerte. Membre retiré depuis : rien à tracer.
+            if (-not $entry -or -not (Test-AdagAuthorized -Member $entry.Member -Whitelist $whitelist)) { continue }
+            $name = if ($entry.Member.SamAccountName) { $entry.Member.SamAccountName } else { $entry.Member.DistinguishedName }
+            , @($name, "$($entry.Path) > $name", $ev.By, ('{0:dd/MM/yyyy HH:mm:ss} sur {1}' -f $ev.Time, $ev.Computer))
+        })
+        if ($traces.Count) {
+            $summary = ($traces | ForEach-Object { "$($_[0]) par $($_[2])" }) -join ', '
+            Write-Log "Ajout(s) autorisé(s) : $summary"
+            if ($WhatIfPreference) { Write-Log 'WhatIf : mail « ajout autorisé » non envoyé' }
+            else {
+                Write-GuardEvent -EventId 1004 -EntryType Information -Message "Ajout(s) autorisé(s) à un groupe d'administration : $summary"
+                $intro = "Les comptes suivants, présents dans la liste blanche, ont été ajoutés à un groupe d'administration (constaté sur <b>$env:COMPUTERNAME</b>)."
+                Send-Notification -Subject "[ADAdminGuard] Information : $($traces.Count) ajout(s) autorisé(s) à un groupe d'administration - $domainName" `
+                    -HtmlBody (New-InfoMailBody -Title "Ajout autorisé à un groupe d'administration" -Intro $intro -Header @('Compte', 'Appartenance', 'Ajouté par', 'Date') -Row $traces)
+            }
         }
+    }
+
+    # 6. État pour l'exécution suivante (premier passage : référence posée sans mail d'information)
+    if (-not $state) { Write-Log 'Premier passage : état de référence enregistré (liste blanche, dernier événement), sans mail d''information' }
+    if ($WhatIfPreference) { Write-Log 'WhatIf : state.json non mis à jour' }
+    else {
+        Save-AdagState -State ([pscustomobject]@{
+            UpdatedAt         = (Get-Date).ToString('s')
+            LastEventRecordId = $maxRecord
+            Whitelist         = @($whitelist | Select-Object -Property Name, Sid)
+        }) -Confirm:$false
     }
 
     Write-Log 'Fin du contrôle'

@@ -1,19 +1,19 @@
 # ADAdminGuard
 
-Garde-fou pour les groupes à privilèges d'Active Directory. Dès qu'un compte est ajouté aux groupes
-**Admins du domaine**, **Administrateurs de l'entreprise** ou **Administrateurs du schéma**, directement ou par un
-groupe imbriqué, ADAdminGuard vérifie qu'il respecte la convention de nommage des comptes d'administration
-ou qu'il figure dans une liste blanche. Sinon, il le met en quarantaine et prévient par mail.
+Garde-fou pour les groupes à privilèges d'Active Directory. Seuls les comptes d'une **liste blanche** (et le compte
+**Administrateur intégré**) peuvent être membres des groupes **Admins du domaine**, **Administrateurs de
+l'entreprise** et **Administrateurs du schéma**, directement ou par un groupe imbriqué. Tout autre compte qui y
+entre est mis en quarantaine, et une alerte part par mail.
 
 Le contrôle tourne sur chaque contrôleur de domaine, en tâche planifiée SYSTEM, déclenchée par les événements
 de sécurité 4728 / 4756 et rejouée toutes les heures. Un configurateur graphique (WinForms) guide la mise en place
-en cinq étapes. Les alertes partent par Microsoft 365 (Graph) ou par un serveur SMTP classique.
+en quatre étapes. Les mails partent par Microsoft 365 (Graph) ou par un serveur SMTP classique.
 
-> **Ce que ADAdminGuard est, et n'est pas.** C'est un contrôle de conformité et un détecteur rapide : il fait
-> respecter la convention de nommage et signale tout ajout non prévu. Ce n'est pas une barrière contre un
-> attaquant déjà administrateur du domaine, qui peut désactiver la tâche ou nommer son compte selon le pattern.
-> Il complète le modèle d'administration en tiers, la délégation restreinte et une supervision (SIEM, Defender
-> for Identity), sans les remplacer.
+> **Ce que ADAdminGuard est, et n'est pas.** C'est un contrôle de conformité et un détecteur rapide : chaque
+> compte d'administration doit être autorisé explicitement, et tout ajout est tracé. Ce n'est pas une barrière
+> contre un attaquant déjà administrateur du domaine ou du DC, qui peut désactiver la tâche ou modifier la liste
+> blanche. Il complète le modèle d'administration en tiers, la délégation restreinte et une supervision (SIEM,
+> Defender for Identity), sans les remplacer.
 
 ---
 
@@ -23,9 +23,11 @@ en cinq étapes. Les alertes partent par Microsoft 365 (Graph) ou par un serveur
 - [Prérequis](#prérequis)
 - [Installation](#installation)
 - [Configuration](#configuration)
+- [Plusieurs contrôleurs de domaine](#plusieurs-contrôleurs-de-domaine)
 - [Application Entra ID pour l'envoi des mails](#application-entra-id-pour-lenvoi-des-mails)
 - [Envoi par serveur SMTP](#envoi-par-serveur-smtp)
 - [Mise en service conseillée](#mise-en-service-conseillée)
+- [Ajouter un administrateur](#ajouter-un-administrateur)
 - [Journalisation](#journalisation)
 - [Exécution manuelle](#exécution-manuelle)
 - [Sécurité](#sécurité)
@@ -50,28 +52,24 @@ La tâche planifiée `ADAdminGuard` s'exécute en **SYSTEM** sur chaque contrôl
 Tout ajout à un groupe global ou universel déclenche le contrôle, y compris l'ajout à un groupe imbriqué dans un
 groupe surveillé.
 
-### Règles
+### Règle
 
 Les groupes surveillés sont identifiés par leur **SID** (RID 512, 519 et 518), pas par leur nom : le contrôle
 fonctionne quelle que soit la langue de l'Active Directory.
 
-Chaque groupe surveillé est parcouru **avec ses groupes imbriqués, à tous les niveaux**. Un compte, direct ou
-indirect, est ignoré s'il :
+Chaque groupe surveillé est parcouru **avec ses groupes imbriqués, à tous les niveaux**. Un membre, direct ou
+indirect, n'est admis que s'il est :
 
-- figure dans la **liste blanche** (`whitelist.txt`) ;
-- respecte le **pattern** (expression régulière sur le `sAMAccountName`, insensible à la casse) ;
-- est l'**Administrateur intégré** (RID 500).
+- l'**Administrateur intégré** (RID 500), toujours admis ;
+- ou présent dans la **liste blanche** (`whitelist.txt`), reconnu par son **SID** : renommer un compte avec le nom
+  d'un compte autorisé ne permet pas de passer.
 
-Le contrôle porte sur **tout le domaine**, quel que soit l'emplacement du compte : les seules exceptions sont le
-pattern et la liste blanche.
+Le contrôle porte sur **tout le domaine**, quel que soit l'emplacement du compte.
 
 Un **groupe imbriqué** présent dans la liste blanche est autorisé à rester imbriqué, mais **ses membres sont
-contrôlés un par un**. Absent de la liste, il est signalé dans le mail ; ses membres sont contrôlés de toute
-façon.
+contrôlés un par un**. Absent de la liste, il est signalé dans l'alerte ; ses membres sont contrôlés de toute façon.
 
-### Actions sur un compte non conforme
-
-Pour un compte utilisateur hors pattern **et** hors liste blanche :
+### Actions sur un compte non autorisé
 
 1. **Retrait du groupe qui le contient directement** : le groupe surveillé, ou le groupe imbriqué par lequel il
    obtient ses droits (le retirer du seul groupe surveillé ne servirait à rien) ;
@@ -87,32 +85,34 @@ ils sont seulement signalés.
 
 | Mode | Effet |
 |---|---|
-| **Simulation** (par défaut) | Détection et mail, **aucune modification de l'AD**. Le mail et le journal détaillent chaque action qui aurait été faite. |
+| **Simulation** (par défaut) | Détection et mails, **aucune modification de l'AD**. L'alerte et le journal détaillent chaque action qui aurait été faite. |
 | **Application** | Les actions ci-dessus sont appliquées. |
 
-Le mode est enregistré dans `config.json` et relu à chaque exécution de la tâche.
+Le mode est choisi à l'installation de la tâche, enregistré dans `config.json` et relu à chaque exécution.
+
+### Mails
+
+| Mail | Quand | Contenu |
+|---|---|---|
+| **Alerte de quarantaine** | Un compte non autorisé est trouvé dans un groupe surveillé | Message de sensibilisation personnalisable (encadré orange), puis pour chaque compte : DN, **chemin d'appartenance** (ex. `Administrateurs de l'entreprise > G-Tier0-Admins > jdupont`), auteur et date de l'ajout, actions faites ou prévues |
+| **Information : liste blanche modifiée** | `whitelist.txt` a changé sur ce DC depuis l'exécution précédente, y compris par une modification à la main | Comptes ajoutés et retirés, avec leur SID (encadré bleu, aucune action) |
+| **Information : ajout autorisé** | Un compte de la liste blanche (ou l'Administrateur intégré) a été ajouté à un groupe surveillé ou à un groupe imbriqué | Compte, chemin d'appartenance, auteur et date de l'ajout (encadré bleu, aucune action) |
+
+Les mails d'information sont envoyés par le DC concerné : celui dont la liste blanche a changé, ou celui qui a
+traité l'ajout (l'événement 4728 / 4756 n'est écrit que sur ce DC). Au **premier passage** après l'installation,
+le contrôle enregistre un état de référence sans envoyer de mail d'information.
 
 ### Auteur de l'ajout
 
-Le mail indique qui a fait l'ajout et quand :
+L'alerte et le mail d'ajout autorisé indiquent qui a fait l'ajout et quand :
 
 1. l'événement 4728 / 4756 correspondant est recherché dans le journal Sécurité du DC qui exécute le contrôle ;
 2. à défaut, la **date et le DC d'origine** de l'ajout sont lus dans les métadonnées de réplication de l'attribut
    `member`, puis l'événement est recherché dans le journal Sécurité de ce DC d'origine.
 
-Si le journal d'un autre DC n'est pas lisible (cas de SYSTEM, voir [Limites](#limites-connues)), le mail donne au
-moins la date et le DC à consulter.
-
-### Mail d'alerte
-
-Un mail récapitulatif est envoyé, via **Microsoft Graph** ou un **serveur SMTP**, à chaque exécution qui trouve au
-moins un compte non conforme. Il contient :
-
-- un **message de sensibilisation** personnalisable, encadré en tête ;
-- pour chaque compte : nom, DN, **chemin d'appartenance** (ex. `Administrateurs de l'entreprise > G-Tier0-Admins > jdupont`),
-  auteur et date de l'ajout, actions faites ou prévues.
-
-**Le pattern n'apparaît jamais dans le mail** : il ne doit pas circuler hors des contrôleurs de domaine.
+Si le journal d'un autre DC n'est pas lisible (cas de SYSTEM, voir [Limites](#limites-connues)), l'alerte donne au
+moins la date et le DC à consulter. Le mail « liste blanche modifiée » ne peut pas nommer l'auteur : un fichier
+modifié ne laisse pas d'événement de sécurité par défaut.
 
 ---
 
@@ -135,8 +135,8 @@ Par GPO liée à l'OU **Domain Controllers** :
 `Configuration ordinateur > Stratégies > Paramètres Windows > Paramètres de sécurité > Configuration avancée de la
 stratégie d'audit > Gestion des comptes > Auditer la gestion des groupes de sécurité` : **Succès**.
 
-Sans cet audit, la tâche ne réagit qu'au contrôle horaire et l'auteur de l'ajout reste inconnu. L'étape
-**5. Planification** du configurateur affiche l'état effectif de l'audit sur le DC.
+Sans cet audit, la tâche ne réagit qu'au contrôle horaire, l'auteur des ajouts reste inconnu et le mail « ajout
+autorisé » n'est pas envoyé. L'étape **4. Planification** du configurateur affiche l'état effectif de l'audit sur le DC.
 
 ---
 
@@ -144,9 +144,10 @@ Sans cet audit, la tâche ne réagit qu'au contrôle horaire et l'auteur de l'aj
 
 1. Copier le dossier sur **chaque contrôleur de domaine**, par exemple dans `C:\Scripts\ADAdminGuard`.
 2. Lancer **`Configurer-ADAdminGuard.bat`** : il demande l'élévation si nécessaire, puis ouvre le configurateur.
-3. Suivre les étapes 1 à 4 du configurateur (voir [Configuration](#configuration)), puis cliquer sur **Enregistrer**.
-4. Étape **5. Planification** > **Installer / mettre à jour la tâche planifiée**, puis choisir **Simulation** ou
-   **Application**.
+3. Suivre les étapes 1 à 3 du configurateur (voir [Configuration](#configuration)), puis cliquer sur **Enregistrer**.
+4. Étape **4. Planification** : renseigner l'OU de quarantaine, puis **Installer / mettre à jour la tâche
+   planifiée** et choisir **Simulation** ou **Application**.
+5. Reporter la configuration sur les autres DC : voir [Plusieurs contrôleurs de domaine](#plusieurs-contrôleurs-de-domaine).
 
 L'installation :
 
@@ -154,55 +155,41 @@ L'installation :
 - crée la source d'événements `ADAdminGuard` dans le journal Application ;
 - **restreint les droits du dossier à SYSTEM et Administrateurs** (voir [Sécurité](#sécurité)).
 
-La configuration est **propre à chaque DC** : le secret client et le mot de passe SMTP sont chiffrés pour la
-machine (DPAPI). Il faut donc ouvrir le configurateur et enregistrer sur chaque DC, ou y ressaisir le secret après
-copie de `config.json`.
-
 ---
 
 ## Configuration
 
-Le configurateur `Show-ADAdminGuardConfig.ps1` (lancé par le `.bat`) guide la mise en place en **cinq étapes
+Le configurateur `Show-ADAdminGuardConfig.ps1` (lancé par le `.bat`) guide la mise en place en **quatre étapes
 numérotées**, parcourues avec **Précédent / Suivant** ou directement par les onglets. Une coche ✓ marque chaque
-étape terminée et un compteur indique la progression. L'installation de la tâche reste **bloquée tant que les
-étapes 1 et 2 ne sont pas faites**. **Enregistrer** écrit `config.json` et `whitelist.txt` à tout moment.
+étape terminée et un compteur indique la progression. L'installation de la tâche reste **bloquée tant que
+l'étape 1 n'est pas faite**. **Enregistrer** écrit `config.json` et `whitelist.txt` à tout moment.
 
 ### Étape 1 : liste blanche
-
-Recensement des comptes à privilèges existants, qui seront exclus du contrôle.
 
 | Élément | Description |
 |---|---|
 | **Groupes surveillés** | Admins du domaine, Administrateurs de l'entreprise, Administrateurs du schéma. |
-| **Importer les membres actuels des groupes cochés** | Ajoute tous les membres, directs et imbriqués (groupes imbriqués compris). |
-| **Liste** | Comptes et groupes exclus, un `sAMAccountName` par ligne, enregistrés dans `whitelist.txt`. Ajout manuel et retrait possibles. |
+| **Importer les membres actuels des groupes cochés** | Ajoute tous les membres, directs et imbriqués (groupes imbriqués compris), avec leur SID. L'Administrateur intégré n'est pas ajouté : il est toujours autorisé. |
+| **Liste** | Comptes autorisés, colonnes *Compte* et *SID*, enregistrés dans `whitelist.txt`. |
+| **Ajouter** | Le nom saisi est recherché dans l'AD pour enregistrer son SID. Un nom introuvable peut être ajouté après confirmation : il est alors comparé sur son nom seul. |
 
-À faire **avant toute mise en service** : un compte existant hors pattern et absent de la liste serait mis en
-quarantaine. Par sécurité, le contrôle **refuse de s'exécuter tant que `whitelist.txt` n'existe pas**.
+À faire **avant toute mise en service** : un compte existant absent de la liste serait mis en quarantaine.
+Par sécurité, le contrôle **refuse de s'exécuter tant que `whitelist.txt` n'existe pas**.
 Terminée quand au moins un groupe est coché et la liste n'est pas vide.
 
-### Étape 2 : pattern
+### Étape 2 : message
 
-| Champ | Description |
-|---|---|
-| **Pattern** | Expression régulière que doit respecter le `sAMAccountName` des nouveaux comptes à privilèges, ex. `^adm-t0-`. Un champ de test indique si un nom serait conforme. |
-| **OU de quarantaine** | Destination des comptes désactivés. Obligatoire en mode application ; son existence est vérifiée à l'enregistrement. |
-
-Terminée quand le pattern est valide et l'OU de quarantaine renseignée.
-
-### Étape 3 : message
-
-Texte de sensibilisation affiché en tête du mail d'alerte. Quatre modèles sont proposés : *Rappel de la
+Texte de sensibilisation affiché en tête de l'alerte de quarantaine. Quatre modèles sont proposés : *Rappel de la
 politique* (par défaut), *Sensibilisation*, *Alerte sécurité* et *Court*. Choisir un modèle remplace le texte
 aussitôt ; *Aucun message* supprime l'encadré ; toute modification à la main fait passer la liste sur
 *Personnalisé*. À la réouverture, l'option correspondant au texte enregistré est présélectionnée.
 
 Les modèles affirment que les comptes « ont été désactivés » : en simulation prolongée, adapter le texte (le mail
-précise de toute façon qu'aucune modification n'a été faite).
+précise de toute façon qu'aucune modification n'a été faite). Les mails d'information ont un texte fixe.
 
-### Étape 4 : notification
+### Étape 3 : notification
 
-Choix de la méthode d'envoi, puis paramètres communs.
+Choix de la méthode d'envoi, puis paramètres communs. Les trois types de mails utilisent ces paramètres.
 
 **Microsoft 365 (Microsoft Graph)** — voir [Application Entra ID](#application-entra-id-pour-lenvoi-des-mails) :
 
@@ -224,29 +211,30 @@ Choix de la méthode d'envoi, puis paramètres communs.
 **Communs** : **Expéditeur** et **Destinataires** (séparés par `;`).
 
 Les secrets (secret client, mot de passe SMTP) sont affichés en points une fois enregistrés ; saisir une nouvelle
-valeur pour les remplacer. **Envoyer un mail de test** envoie un mail avec le message de l'étape 3, pour aperçu.
+valeur pour les remplacer. **Envoyer un mail de test** envoie un mail avec le message de l'étape 2, pour aperçu.
 En cas d'échec, le message affiche la cause : motif Entra ID / Graph (`AADSTS…`, permission manquante…) ou
 erreur du serveur SMTP. Terminée quand les champs de la méthode choisie sont remplis.
 
-### Étape 5 : planification
+### Étape 4 : planification
 
-| Bouton | Effet |
+| Élément | Effet |
 |---|---|
+| **OU de quarantaine** | Destination des comptes désactivés. Obligatoire en mode application ; son existence est vérifiée à l'enregistrement. |
 | **Installer / mettre à jour la tâche planifiée** | Enregistre la configuration, demande le mode (**Simulation** / **Application**), installe la tâche. Prévient si l'audit est inactif ou la notification non configurée. |
 | **Supprimer la tâche planifiée** | Désinstalle la tâche sur ce DC. |
-| **Contrôler maintenant sans rien modifier (-WhatIf)** | Lance le contrôle dans une console, avec le compte courant. Le mail est envoyé s'il y a un compte non conforme. |
+| **Contrôler maintenant sans rien modifier (-WhatIf)** | Lance le contrôle dans une console, avec le compte courant. L'alerte est envoyée s'il y a un compte non autorisé ; les mails d'information ne le sont pas. |
 | **Exécuter la tâche maintenant (en SYSTEM)** | Lance la vraie tâche planifiée : test le plus fidèle d'un déclenchement automatique. |
 | **Ouvrir le dossier des journaux** | Ouvre `logs\`. |
 | **Revérifier l'audit** | Relit l'état effectif de l'audit « Gestion des groupes de sécurité ». |
+| **Exporter / Importer une configuration** | Voir [Plusieurs contrôleurs de domaine](#plusieurs-contrôleurs-de-domaine). |
 
 L'étape affiche aussi l'état de la tâche, le mode enregistré et l'état de l'audit. Terminée quand la tâche est
 installée.
 
-### Fichier `config.json`
+### Fichiers `config.json` et `whitelist.txt`
 
 ```json
 {
-  "Pattern": "^adm-t0-",
   "Groups": ["DomainAdmins", "EnterpriseAdmins", "SchemaAdmins"],
   "QuarantineOU": "OU=Quarantaine,OU=Administration,DC=contoso,DC=local",
   "SimulationMode": true,
@@ -269,7 +257,35 @@ installée.
 
 `Method` vaut `Graph` (Microsoft 365) ou `Smtp`.
 
+```text
+# Comptes autorisés dans les groupes surveillés par ADAdminGuard : « sAMAccountName;SID », # = commentaire.
+adm-jdupont;S-1-5-21-1111111111-2222222222-3333333333-1105
+G-Tier0-Admins;S-1-5-21-1111111111-2222222222-3333333333-1120
+```
+
+Une ligne sans SID (`nom` seul) est comparée sur le nom ; le journal du contrôle le signale à chaque exécution.
+
 ---
+
+## Plusieurs contrôleurs de domaine
+
+La configuration, la liste blanche et l'état sont **propres à chaque DC** : rien n'est répliqué automatiquement.
+C'est voulu : la liste blanche ne peut être modifiée que par un administrateur d'un DC, et non par quiconque
+aurait reçu des droits sur un objet de l'annuaire.
+
+Pour reporter une configuration :
+
+1. Sur le DC de référence, étape 4 : **Exporter la configuration**. Le fichier `.json` contient la configuration
+   et la liste blanche, **jamais les secrets**.
+2. Sur chaque autre DC : **Importer une configuration**, vérifier les étapes, ressaisir le secret client ou le mot de
+   passe SMTP à l'étape 3 s'il n'est pas déjà enregistré sur ce DC, puis **Enregistrer** et installer la tâche.
+
+Les SID étant communs à tout le domaine, la liste blanche exportée est valable sur tous les DC. Une liste blanche
+non reportée sur un DC fait mettre en quarantaine, par ce DC, le compte qui y manque, au plus tard au contrôle
+horaire suivant.
+
+---
+
 ## Application Entra ID pour l'envoi des mails
 
 1. **Entra ID > Inscriptions d'applications > Nouvelle inscription** (compte unique du locataire, sans URI de redirection).
@@ -312,14 +328,27 @@ Microsoft : avec un locataire Microsoft 365, préférer la méthode Graph.
 
 ## Mise en service conseillée
 
-1. Activer l'audit sur les DC et vérifier qu'il apparaît en vert à l'étape **5. Planification**.
-2. Sur chaque DC : suivre les étapes 1 à 4 du configurateur (**importer les membres actuels** dans la liste blanche), enregistrer.
-3. **Envoyer un mail de test** (étape 4).
-4. Installer la tâche en **Simulation**.
-5. Ajouter un compte de test hors pattern à *Admins du domaine* : vérifier le mail (chemin d'appartenance,
+1. Activer l'audit sur les DC et vérifier qu'il apparaît en vert à l'étape **4. Planification**.
+2. Sur un premier DC : **importer les membres actuels** dans la liste blanche (étape 1), la relire et retirer les
+   comptes qui n'ont rien à faire dans ces groupes, puis suivre les étapes 2 et 3 et **Enregistrer**.
+3. **Envoyer un mail de test** (étape 3).
+4. Installer la tâche en **Simulation** (étape 4).
+5. **Exporter** la configuration et l'**importer** sur chaque autre DC, avec le secret, puis y installer la tâche
+   en simulation.
+6. Ajouter un compte de test hors liste blanche à *Admins du domaine* : vérifier l'alerte (chemin d'appartenance,
    auteur, actions prévues) et le journal.
-6. Laisser tourner quelques jours en simulation pour repérer les comptes légitimes oubliés.
-7. Réinstaller la tâche en **Application**.
+7. Laisser tourner quelques jours en simulation pour repérer les comptes légitimes oubliés.
+8. Réinstaller la tâche en **Application** sur chaque DC.
+
+---
+
+## Ajouter un administrateur
+
+1. Sur **chaque** DC (ou sur un DC puis Exporter / Importer) : étape 1, **Ajouter** le compte à la liste blanche,
+   **Enregistrer**. Un mail « liste blanche modifiée » part de chaque DC modifié.
+2. Ajouter ensuite le compte au groupe d'administration. Un mail « ajout autorisé » trace l'opération.
+
+Dans l'ordre inverse, le compte est mis en quarantaine dès son ajout au groupe.
 
 ---
 
@@ -327,28 +356,29 @@ Microsoft : avec un locataire Microsoft 365, préférer la méthode Graph.
 
 | Emplacement | Contenu |
 |---|---|
-| `logs\ADAdminGuard_AAAAMMJJ.log` | Un fichier par jour, purgé après 90 jours : configuration lue, état de l'audit, nombre d'événements lus, comptes non conformes, actions, envoi du mail, erreurs. |
+| `logs\ADAdminGuard_AAAAMMJJ.log` | Un fichier par jour, purgé après 90 jours : configuration lue, état de l'audit, nombre d'événements lus, comptes non autorisés, actions, modifications de la liste blanche, ajouts autorisés, envois de mails, erreurs. |
 | Journal **Application**, source `ADAdminGuard` | Pour la supervision (SIEM) : |
 | — ID **1000** (Avertissement) | Compte mis en quarantaine |
-| — ID **1001** (Avertissement) | Compte non conforme détecté sans action (simulation, `-WhatIf`, objet autre qu'un utilisateur) |
-| — ID **1002** (Erreur) | Erreur du contrôle ou échec de l'envoi du mail |
-
-Le pattern figure dans le journal du script (dossier réservé à SYSTEM et Administrateurs), jamais dans le mail ni
-dans le journal Application.
+| — ID **1001** (Avertissement) | Compte non autorisé détecté sans action (simulation, `-WhatIf`, objet autre qu'un utilisateur) |
+| — ID **1002** (Erreur) | Erreur du contrôle ou échec de l'envoi d'un mail |
+| — ID **1003** (Information) | Liste blanche modifiée sur ce DC |
+| — ID **1004** (Information) | Ajout autorisé à un groupe d'administration |
+| `state.json` | État entre deux exécutions : dernier événement traité, liste blanche vue. Le supprimer refait un passage de référence, sans mail d'information. |
 
 ---
 
 ## Exécution manuelle
 
 ```powershell
-# Contrôle sans rien modifier : affiche les actions prévues et envoie le mail
+# Contrôle sans rien modifier : affiche les actions prévues et envoie l'alerte s'il y a lieu
 .\Invoke-ADAdminGuard.ps1 -WhatIf
 
-# Fenêtre de recherche des événements 4728/4756 (minutes, 120 par défaut) et dossier de journaux
+# Fenêtre de lecture des événements 4728/4756 (minutes, 120 par défaut) et dossier de journaux
 .\Invoke-ADAdminGuard.ps1 -EventLookbackMinutes 240 -LogDir D:\Logs\ADAdminGuard
 ```
 
-À lancer dans une console **élevée** : la lecture du journal Sécurité l'exige.
+À lancer dans une console **élevée** : la lecture du journal Sécurité l'exige. Avec `-WhatIf`, les mails
+d'information ne sont pas envoyés et `state.json` n'est pas mis à jour.
 
 ---
 
@@ -357,10 +387,10 @@ dans le journal Application.
 - **Droits du dossier.** Le script s'exécute en SYSTEM sur un contrôleur de domaine : quiconque pourrait le
   modifier obtiendrait ces droits. L'installation retire l'héritage et limite le dossier à SYSTEM et Administrateurs.
   Ne pas placer le dossier sur un partage.
+- **Liste blanche.** Locale à chaque DC, modifiable seulement par ses administrateurs, et toute modification est
+  signalée par mail. À tenir courte et à revoir régulièrement : chaque entrée est un compte d'administration admis.
 - **Secret client et mot de passe SMTP.** Chiffrés avec DPAPI en portée machine : lisibles uniquement sur le DC qui
-  les a enregistrés, jamais stockés en clair, jamais affichés par le configurateur.
-- **Pattern.** Absent du mail et du journal Application. Le connaître facilite le contournement du contrôle.
-- **Liste blanche.** À tenir courte et à revoir régulièrement : chaque entrée est un compte qui échappe au contrôle.
+  les a enregistrés, jamais stockés en clair, jamais affichés par le configurateur, jamais exportés.
 - **Mode simulation par défaut**, et refus de fonctionner sans liste blanche : une mauvaise configuration ne peut
   pas mettre en quarantaine les administrateurs en place.
 
@@ -368,14 +398,14 @@ dans le journal Application.
 
 ## Limites connues
 
-- **Contournable par un administrateur du domaine** : il peut désactiver la tâche ou nommer son compte selon le
-  pattern. Superviser les événements 4728 / 4756 et l'ID 1002 dans un SIEM.
+- **Contournable par un administrateur du domaine ou du DC** : il peut désactiver la tâche ou modifier la liste
+  blanche (ce qui est signalé par mail). Superviser les événements 4728 / 4756 et les ID 1002 / 1003 dans un SIEM.
 - **Journal Sécurité des autres DC.** En SYSTEM, la tâche agit avec le compte ordinateur du DC, qui ne peut pas lire
   par défaut le journal Sécurité d'un autre DC. L'auteur est trouvé quand l'ajout a été traité par le DC qui exécute
   le contrôle, ce qui est le cas des déclenchements par événement. Pour un rattrapage horaire d'un ajout fait
-  ailleurs, le mail indique la date et le DC à consulter.
-- **Mails en double.** Le contrôle horaire tourne sur chaque DC : une anomalie qui persiste (mode simulation)
-  peut être signalée par plusieurs DC.
+  ailleurs, l'alerte indique la date et le DC à consulter.
+- **Mails d'alerte en double.** Le contrôle horaire tourne sur chaque DC : une anomalie qui persiste (mode
+  simulation) peut être signalée par plusieurs DC.
 - **Forêt multi-domaines.** Les groupes Administrateurs de l'entreprise et du schéma sont lus dans le domaine racine
   de la forêt ; le fonctionnement a été conçu et testé pour une forêt à domaine unique.
 - **Domaine local.** Les ajouts à un groupe de domaine local (événement 4732, ex. *Administrateurs* intégré) ne
@@ -388,7 +418,10 @@ dans le journal Application.
 | Symptôme | Cause probable |
 |---|---|
 | `whitelist.txt absent` dans le journal | Importer les membres actuels à l'étape 1, puis Enregistrer. |
+| Un administrateur légitime mis en quarantaine | Absent de la liste blanche d'au moins un DC : l'ajouter partout (Exporter / Importer), puis le réactiver et le remettre dans son groupe. |
+| « Entrée(s) de liste blanche sans SID » dans le journal | Ligne au format ancien ou compte introuvable à l'ajout : rouvrir le configurateur, retirer et rajouter le compte, Enregistrer. |
 | « Ajouté par » inconnu | Audit inactif sur le DC, ajout traité par un autre DC, ou journal Sécurité illisible : le journal du script précise le cas (nombre d'événements lus, DC d'origine, SID vus). |
+| Pas de mail « ajout autorisé » | Audit inactif, ajout traité par un autre DC (c'est lui qui envoie le mail), ou premier passage après l'installation. |
 | `AADSTS7000215` / `invalid_client` | Secret erroné : saisir la *Valeur* du secret, pas son ID. |
 | `AADSTS700016` | ID d'application erroné ou application d'un autre locataire. |
 | `ErrorAccessDenied` à l'envoi | Permission `Mail.Send` absente, consentement non accordé, ou boîte expéditrice hors du périmètre RBAC. |
@@ -404,11 +437,12 @@ dans le journal Application.
 | Fichier | Rôle |
 |---|---|
 | `Configurer-ADAdminGuard.bat` | Lanceur du configurateur, avec élévation automatique. |
-| `Show-ADAdminGuardConfig.ps1` | Configurateur graphique en cinq étapes. |
+| `Show-ADAdminGuardConfig.ps1` | Configurateur graphique en quatre étapes. |
 | `Invoke-ADAdminGuard.ps1` | Contrôle, exécuté par la tâche planifiée. |
-| `ADAdminGuard.psm1` | Fonctions communes : configuration, liste blanche, secrets, envoi Graph et SMTP, AD, tâche planifiée. |
+| `ADAdminGuard.psm1` | Fonctions communes : configuration, liste blanche, état, export / import, secrets, envoi Graph et SMTP, AD, tâche planifiée. |
 | `config.json` | Configuration, créée par le configurateur (non versionnée). |
 | `whitelist.txt` | Liste blanche, créée par le configurateur (non versionnée). |
+| `state.json` | État entre deux exécutions (non versionné). |
 | `logs\` | Journaux quotidiens (non versionnés). |
 
 Tous les scripts sont compatibles Windows PowerShell 5.1 et encodés en UTF-8 avec BOM.

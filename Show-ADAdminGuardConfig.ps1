@@ -2,21 +2,21 @@
 #Requires -Modules ActiveDirectory
 <#
 .SYNOPSIS
-    Configurateur graphique de ADAdminGuard, en cinq étapes guidées.
+    Configurateur graphique d'ADAdminGuard, en quatre étapes guidées.
 .DESCRIPTION
-    Ouvre une fenêtre à cinq étapes numérotées, parcourues avec Précédent / Suivant ou directement par les onglets :
-      1. Liste blanche  : groupes surveillés, comptes exclus (whitelist.txt), import des membres actuels ;
-      2. Pattern        : convention de nommage des comptes à privilèges (avec test), OU de quarantaine ;
-      3. Message        : message de sensibilisation en tête du mail (modèles ou texte personnalisé) ;
-      4. Notification   : envoi par Microsoft 365 (Graph) ou par serveur SMTP, destinataires, mail de test ;
-      5. Planification  : audit, installation de la tâche (simulation ou application), tests, journaux.
-    Une coche marque chaque étape terminée ; l'installation reste bloquée tant que les étapes 1 et 2 ne le sont pas.
-    Les secrets (secret client, mot de passe SMTP) sont chiffrés avec DPAPI pour cette machine : lancer le
-    configurateur sur chaque contrôleur de domaine où la tâche doit tourner.
+    Ouvre une fenêtre à quatre étapes numérotées, parcourues avec Précédent / Suivant ou directement par les onglets :
+      1. Liste blanche  : groupes surveillés, comptes autorisés (whitelist.txt, avec leur SID), import des membres actuels ;
+      2. Message        : message de sensibilisation en tête de l'alerte de quarantaine (modèles ou texte personnalisé) ;
+      3. Notification   : envoi par Microsoft 365 (Graph) ou par serveur SMTP, destinataires, mail de test ;
+      4. Planification  : OU de quarantaine, audit, installation de la tâche (simulation ou application), tests,
+                          journaux, export / import de la configuration vers les autres contrôleurs de domaine.
+    Une coche marque chaque étape terminée ; l'installation reste bloquée tant que l'étape 1 ne l'est pas.
+    Les secrets (secret client, mot de passe SMTP) sont chiffrés avec DPAPI pour cette machine et ne sont jamais
+    exportés : les ressaisir sur chaque contrôleur de domaine après un import.
 .EXAMPLE
     .\Show-ADAdminGuardConfig.ps1
 .NOTES
-    Version : 1.1 (2026-11-05) - étapes guidées, envoi SMTP
+    Version : 2.0 (2026-11-05) - liste blanche seule (par SID), export / import
 #>
 [CmdletBinding()]
 param()
@@ -43,7 +43,7 @@ $script:SecretMask = [string][char]0x2063 * 16
 # Conteneurs proposés : toutes les OU + CN=Users (conteneur par défaut des nouveaux comptes)
 $containers = @(@((Get-ADDomain).UsersContainer) + @(Get-ADOrganizationalUnit -Filter * | Select-Object -ExpandProperty DistinguishedName) | Sort-Object)
 
-$stepTitles = @('1. Liste blanche', '2. Pattern', '3. Message', '4. Notification', '5. Planification')
+$stepTitles = @('1. Liste blanche', '2. Message', '3. Notification', '4. Planification')
 $checkMark  = [string][char]0x2713
 
 #region Fonctions d'interface
@@ -108,7 +108,7 @@ function Select-InstallMode {
     [void](Add-Control -Parent $dlg -Type Label -X 60 -Y 12 -Width 395 -Height 180 -Text (
         "Dans quel mode installer la tâche ?`r`n`r`n" +
         "Simulation : la tâche détecte et envoie le mail en détaillant ce qu'elle aurait fait, sans modifier l'AD.`r`n`r`n" +
-        "Application : les comptes hors pattern ET hors liste blanche sont retirés des groupes, désactivés et déplacés.`r`n`r`n" +
+        "Application : les comptes hors liste blanche (l'Administrateur intégré excepté) sont retirés des groupes, désactivés et déplacés.`r`n`r`n" +
         "Les droits du dossier $(Get-AdagRoot) seront restreints à SYSTEM et Administrateurs."))
 
     $btnSim = Add-Control -Parent $dlg -Type Button -X 120 -Y 205 -Width 110 -Height 28 -Text 'Simulation'
@@ -134,6 +134,23 @@ function Get-SelectedGroupKey {
     @($script:GroupChecks.Keys | Where-Object { $script:GroupChecks[$_].Checked })
 }
 
+function Get-WhitelistEntry {
+    @($lvWhite.Items | ForEach-Object { $_.Tag })
+}
+
+function Add-WhitelistEntry {
+    # Ajoute une ligne (nom, SID) à la liste affichée ; renvoie $false si le compte y est déjà
+    param([Parameter(Mandatory)][string]$Name, [AllowEmptyString()][string]$Sid)
+    foreach ($w in Get-WhitelistEntry) {
+        if (($Sid -and $w.Sid -eq $Sid) -or (-not $Sid -and $w.Name -eq $Name)) { return $false }
+    }
+    $item = New-Object Windows.Forms.ListViewItem($Name)
+    [void]$item.SubItems.Add($(if ($Sid) { $Sid } else { '(SID inconnu : comparé sur le nom)' }))
+    $item.Tag = [pscustomobject]@{ Name = $Name; Sid = $Sid }
+    [void]$lvWhite.Items.Add($item)
+    $true
+}
+
 function Get-SecretValue {
     # Secret à enregistrer : nouveau secret chiffré s'il a été saisi, sinon celui déjà enregistré
     param([Parameter(Mandatory)] $Box, [AllowEmptyString()][string]$Stored)
@@ -146,7 +163,6 @@ function Get-FormConfig {
     [void][int]::TryParse($txtSmtpPort.Text.Trim(), [ref]$port)
     $smtpUser = $txtSmtpUser.Text.Trim()
     [pscustomobject]@{
-        Pattern        = $txtPattern.Text.Trim()
         Groups         = @(Get-SelectedGroupKey)
         QuarantineOU   = $cmbQuar.Text.Trim()
         SimulationMode = $script:SimulationMode
@@ -166,6 +182,32 @@ function Get-FormConfig {
             To                    = $txtTo.Text.Trim()
         }
     }
+}
+
+function Set-FormFromConfig {
+    # Remplit les étapes depuis une configuration (au chargement, ou depuis un export) ; les secrets ne sont pas touchés
+    param([Parameter(Mandatory)] $Config, [AllowEmptyCollection()][object[]]$Whitelist = @())
+    foreach ($k in $script:GroupChecks.Keys) { $script:GroupChecks[$k].Checked = @($Config.Groups) -contains $k }
+    $lvWhite.Items.Clear()
+    foreach ($w in $Whitelist) { [void](Add-WhitelistEntry -Name $w.Name -Sid $w.Sid) }
+    $cmbQuar.Text = [string]$Config.QuarantineOU
+    $script:SimulationMode = [bool]$Config.SimulationMode
+    $script:TemplateSync = $true
+    $txtMessage.Text = ([string]$Config.MailMessage -replace "`r", '') -replace "`n", "`r`n"
+    $script:TemplateSync = $false
+    Set-TemplateSelection -Name (Get-MessageTemplateName -Text $txtMessage.Text)
+    $m = $Config.Mail
+    $rbSmtp.Checked  = $m.Method -eq 'Smtp'
+    $rbGraph.Checked = -not $rbSmtp.Checked
+    $txtTenant.Text     = [string]$m.TenantId
+    $txtClient.Text     = [string]$m.ClientId
+    $txtSmtpServer.Text = [string]$m.SmtpServer
+    $txtSmtpPort.Text   = [string]$m.SmtpPort
+    $chkSmtpSsl.Checked = [bool]$m.SmtpSsl
+    $txtSmtpUser.Text   = [string]$m.SmtpUser
+    $txtFrom.Text       = [string]$m.From
+    $txtTo.Text         = [string]$m.To
+    Update-MailMethod
 }
 
 function Update-SecretState {
@@ -191,12 +233,12 @@ function Update-MailMethod {
         "L'application Entra ID doit avoir la permission Microsoft Graph Mail.Send de type Application, avec consentement " +
         "administrateur. Limitez-la à la boîte expéditrice (RBAC for Applications d'Exchange Online), sinon elle peut " +
         "écrire au nom de n'importe quelle boîte.`r`n`r`n" +
-        "Le secret est chiffré avec DPAPI pour CETTE machine : enregistrez la configuration sur chaque contrôleur de domaine."
+        "Le secret est chiffré avec DPAPI pour CETTE machine et n'est jamais exporté : saisissez-le sur chaque contrôleur de domaine."
     }
     else {
         "Relais SMTP interne ou serveur de messagerie. Chiffrement STARTTLS sur les ports 587 ou 25 ; le SSL implicite " +
         "(port 465) n'est pas pris en charge. Laissez « Utilisateur » vide pour un relais anonyme autorisé par adresse IP.`r`n`r`n" +
-        "Le mot de passe est chiffré avec DPAPI pour CETTE machine : enregistrez la configuration sur chaque contrôleur de domaine."
+        "Le mot de passe est chiffré avec DPAPI pour CETTE machine et n'est jamais exporté : saisissez-le sur chaque contrôleur de domaine."
     }
 }
 
@@ -218,10 +260,8 @@ function Update-AuditState {
         $lblAudit.ForeColor = 'DarkGreen'
     }
     elseif ($script:AuditState.Enabled -eq $false) {
-        $lblAudit.Text = "$head`r`nSans succès audité, la tâche ne réagit qu'au contrôle horaire et l'auteur de l'ajout reste inconnu.`r`n" +
-            "À activer par GPO liée à l'OU Domain Controllers : Configuration ordinateur > Stratégies > Paramètres Windows > " +
-            "Paramètres de sécurité > Configuration avancée de la stratégie d'audit > Gestion des comptes > " +
-            "Auditer la gestion des groupes de sécurité : Succès."
+        $lblAudit.Text = "$head`r`nÀ activer par GPO sur l'OU Domain Controllers : Configuration avancée de la stratégie d'audit > " +
+            "Gestion des comptes > Auditer la gestion des groupes de sécurité : Succès."
         $lblAudit.ForeColor = 'Firebrick'
     }
     else {
@@ -230,14 +270,8 @@ function Update-AuditState {
     }
 }
 
-function Test-PatternValid {
-    $p = $txtPattern.Text.Trim()
-    if (-not $p) { return $false }
-    try { [void][regex]::new($p); $true } catch { $false }
-}
-
 function Test-MailReady {
-    # Champs de l'étape 4 remplis pour la méthode choisie (secret saisi ou déjà enregistré)
+    # Champs de l'étape 3 remplis pour la méthode choisie (secret saisi ou déjà enregistré)
     $hasSecret = { param($box, $stored) [bool](($box.Text -and $box.Text -ne $script:SecretMask) -or $stored) }
     if (-not ($txtFrom.Text.Trim() -and $txtTo.Text.Trim())) { return $false }
     if ($rbSmtp.Checked) {
@@ -251,11 +285,10 @@ function Test-MailReady {
 function Test-StepDone {
     param([int]$Step)
     switch ($Step) {
-        1 { return [bool](@(Get-SelectedGroupKey).Count -and $lstWhite.Items.Count) }
-        2 { return [bool]((Test-PatternValid) -and $cmbQuar.Text.Trim()) }
-        3 { return $true }
-        4 { return (Test-MailReady) }
-        5 { return [bool]$script:TaskInstalled }
+        1 { return [bool](@(Get-SelectedGroupKey).Count -and $lvWhite.Items.Count) }
+        2 { return $true }
+        3 { return (Test-MailReady) }
+        4 { return [bool]$script:TaskInstalled }
     }
 }
 
@@ -273,11 +306,9 @@ function Update-StepState {
     $btnPrev.Enabled = $tabs.SelectedIndex -gt 0
     $btnNext.Enabled = $tabs.SelectedIndex -lt ($stepTitles.Count - 1)
 
-    $missing = @()
-    if (-not (Test-StepDone -Step 1)) { $missing += 'étape 1 (au moins un groupe et une liste blanche non vide)' }
-    if (-not (Test-PatternValid)) { $missing += 'étape 2 (pattern valide)' }
-    $btnInstall.Enabled = $missing.Count -eq 0
-    $lblBlocked.Text = if ($missing.Count) { "Installation impossible tant que ne sont pas terminées : $($missing -join ', ')." } else { '' }
+    $ready = Test-StepDone -Step 1
+    $btnInstall.Enabled = $ready
+    $lblBlocked.Text = if ($ready) { '' } else { "Installation impossible tant que l'étape 1 n'est pas terminée (au moins un groupe et une liste blanche non vide)." }
 }
 
 function Save-FormConfig {
@@ -297,7 +328,7 @@ function Save-FormConfig {
     }
 
     Save-AdagConfig -Config $c
-    Save-AdagWhitelist -Name @($lstWhite.Items | ForEach-Object { [string]$_ })
+    Save-AdagWhitelist -Entry @(Get-WhitelistEntry)
     $script:SecretProtected = $c.Mail.SecretProtected
     $script:SmtpPasswordProtected = $c.Mail.SmtpPasswordProtected
     Update-SecretState
@@ -321,61 +352,69 @@ $form.Font = New-Object Drawing.Font('Segoe UI', 9)
 
 $tabs = Add-Control -Parent $form -Type TabControl -X 10 -Y 10 -Width 720 -Height 515
 $tabWhite  = New-Object Windows.Forms.TabPage
-$tabRules  = New-Object Windows.Forms.TabPage
 $tabMsg    = New-Object Windows.Forms.TabPage
 $tabMail   = New-Object Windows.Forms.TabPage
 $tabDeploy = New-Object Windows.Forms.TabPage
-$tabs.TabPages.AddRange(@($tabWhite, $tabRules, $tabMsg, $tabMail, $tabDeploy))
+$tabs.TabPages.AddRange(@($tabWhite, $tabMsg, $tabMail, $tabDeploy))
 for ($i = 0; $i -lt $stepTitles.Count; $i++) { $tabs.TabPages[$i].Text = $stepTitles[$i] }
 
 #endregion
 
 #region Étape 1 : liste blanche
 
-Add-StepIntro -Parent $tabWhite -Text ("Étape 1 - Recensez les comptes à privilèges existants : ils seront exclus du contrôle. " +
-    "Tout compte ajouté ensuite aux groupes surveillés devra respecter le pattern de l'étape 2.")
+Add-StepIntro -Parent $tabWhite -Text ("Étape 1 - Recensez les comptes autorisés dans les groupes surveillés. Tout autre compte qui y " +
+    "entre, directement ou par un groupe imbriqué, est mis en quarantaine ; l'Administrateur intégré est toujours autorisé.")
 
 [void](Add-Control -Parent $tabWhite -Type Label -X 10 -Y 48 -Width 400 -Text 'Groupes surveillés :')
 $script:GroupChecks = [ordered]@{}
 $y = 68
 foreach ($k in $groupDefs.Keys) {
     $chk = Add-Control -Parent $tabWhite -Type CheckBox -X 20 -Y $y -Width 460 -Text $groupDefs[$k].Label
-    $chk.Checked = @($cfg.Groups) -contains $k
     $chk.Add_CheckedChanged({ Update-StepState })
     $script:GroupChecks[$k] = $chk
     $y += 22
 }
 $btnImport = Add-Control -Parent $tabWhite -Type Button -X 500 -Y 66 -Width 200 -Height 60 -Text 'Importer les membres actuels des groupes cochés'
 
-[void](Add-Control -Parent $tabWhite -Type Label -X 10 -Y 140 -Width 690 -Text 'Comptes exclus du contrôle (sAMAccountName), enregistrés dans whitelist.txt :')
-$lstWhite = Add-Control -Parent $tabWhite -Type ListBox -X 10 -Y 162 -Width 570 -Height 200
-$lstWhite.Sorted = $true
-$lstWhite.SelectionMode = 'MultiExtended'
-foreach ($n in @(Get-AdagWhitelist)) { [void]$lstWhite.Items.Add($n) }
+[void](Add-Control -Parent $tabWhite -Type Label -X 10 -Y 140 -Width 690 -Text 'Comptes autorisés, enregistrés dans whitelist.txt (le SID fait foi, pas le nom) :')
+$lvWhite = Add-Control -Parent $tabWhite -Type ListView -X 10 -Y 162 -Width 570 -Height 200
+$lvWhite.View = 'Details'
+$lvWhite.FullRowSelect = $true
+$lvWhite.MultiSelect = $true
+$lvWhite.HideSelection = $false
+$lvWhite.Sorting = 'Ascending'
+[void]$lvWhite.Columns.Add('Compte', 180)
+[void]$lvWhite.Columns.Add('SID', 365)
 $btnWhiteRemove = Add-Control -Parent $tabWhite -Type Button -X 590 -Y 162 -Width 110 -Text 'Retirer'
 
 $txtWhite = Add-Control -Parent $tabWhite -Type TextBox -X 10 -Y 372 -Width 570
 $btnWhiteAdd = Add-Control -Parent $tabWhite -Type Button -X 590 -Y 371 -Width 110 -Text 'Ajouter'
 
 $lblWhiteHint = Add-Control -Parent $tabWhite -Type Label -X 10 -Y 405 -Width 690 -Height 70 -Text (
-    "L'import reprend les membres directs et imbriqués. Un groupe de la liste peut rester imbriqué, mais ses membres sont " +
-    "contrôlés un par un. Tenez cette liste courte : chaque entrée échappe au contrôle.`r`n" +
-    "Le contrôle refuse de tourner tant que whitelist.txt n'existe pas (bouton Enregistrer).")
+    "Un compte ajouté est recherché dans l'AD pour enregistrer son SID. Un groupe de la liste peut rester imbriqué, mais ses " +
+    "membres sont contrôlés un par un. Toute modification de la liste déclenche un mail d'information.`r`n" +
+    "La liste est propre à ce DC : reportez-la sur les autres avec Exporter / Importer (étape 4).")
 $lblWhiteHint.ForeColor = 'DimGray'
 
 $btnWhiteAdd.Add_Click({
     $n = $txtWhite.Text.Trim()
-    if (-not $n -or @($lstWhite.Items) -contains $n) { return }
-    $found = @(Get-ADObject -LDAPFilter "(sAMAccountName=$($n -replace '([\\*()])', '\$1'))")
-    if (-not $found.Count -and -not (Confirm-Action -Text "Aucun objet « $n » trouvé dans le domaine. L'ajouter quand même ?")) { return }
-    [void]$lstWhite.Items.Add($n)
+    if (-not $n) { return }
+    $found = @(Get-ADObject -LDAPFilter "(sAMAccountName=$($n -replace '([\\*()])', '\$1'))" -Properties objectSid, sAMAccountName)
+    $sid = ''
+    if ($found.Count) { $sid = [string]$found[0].objectSid.Value }
+    elseif (-not (Confirm-Action -Text ("Aucun objet « $n » trouvé dans le domaine. L'ajouter quand même ?`r`n`r`n" +
+            "Sans SID, il sera comparé sur son nom seul : un autre compte renommé ainsi serait aussi autorisé."))) { return }
+    if (-not (Add-WhitelistEntry -Name $(if ($found.Count) { [string]$found[0].sAMAccountName } else { $n }) -Sid $sid)) {
+        Show-Message -Text "« $n » est déjà dans la liste."
+        return
+    }
     $txtWhite.Clear()
     Update-StepState
 })
 $txtWhite.Add_KeyDown({ if ($_.KeyCode -eq 'Enter') { $btnWhiteAdd.PerformClick(); $_.SuppressKeyPress = $true } })
 
 $btnWhiteRemove.Add_Click({
-    foreach ($item in @($lstWhite.SelectedItems)) { $lstWhite.Items.Remove($item) }
+    foreach ($item in @($lvWhite.SelectedItems)) { $lvWhite.Items.Remove($item) }
     Update-StepState
 })
 
@@ -385,14 +424,13 @@ $btnImport.Add_Click({
     try {
         $form.Cursor = 'WaitCursor'
         $added = @()
-        # Membres directs et imbriqués : les groupes imbriqués sont ajoutés aussi, pour autoriser l'imbrication
+        # Membres directs et imbriqués, Administrateur intégré excepté (toujours autorisé) ;
+        # les groupes imbriqués sont ajoutés aussi, pour autoriser l'imbrication
         foreach ($gi in @(Get-AdagGroup -Key $keys)) {
             foreach ($e in @(Get-AdagEffectiveMember -GroupInfo $gi)) {
-                $n = $e.Member.SamAccountName
-                if ($n -and @($lstWhite.Items) -notcontains $n) {
-                    [void]$lstWhite.Items.Add($n)
-                    $added += "$n  (via $($e.Path))"
-                }
+                $m = $e.Member
+                if (-not $m.SamAccountName -or $m.Sid -like '*-500') { continue }
+                if (Add-WhitelistEntry -Name $m.SamAccountName -Sid $m.Sid) { $added += "$($m.SamAccountName)  (via $($e.Path))" }
             }
         }
         Update-StepState
@@ -405,51 +443,7 @@ $btnImport.Add_Click({
 
 #endregion
 
-#region Étape 2 : pattern et quarantaine
-
-Add-StepIntro -Parent $tabRules -Text ("Étape 2 - Définissez la convention de nommage des nouveaux comptes à privilèges, " +
-    "et l'OU où seront déplacés les comptes non conformes.")
-
-[void](Add-Control -Parent $tabRules -Type Label -X 10 -Y 48 -Width 690 -Text 'Pattern que doivent respecter les comptes à privilèges (expression régulière sur le sAMAccountName, insensible à la casse) :')
-$txtPattern = Add-Control -Parent $tabRules -Type TextBox -X 10 -Y 70 -Width 690 -Text $cfg.Pattern
-$txtPattern.Font = New-Object Drawing.Font('Consolas', 10)
-
-[void](Add-Control -Parent $tabRules -Type Label -X 10 -Y 106 -Width 100 -Text 'Tester un nom :')
-$txtTest = Add-Control -Parent $tabRules -Type TextBox -X 110 -Y 103 -Width 200
-$lblTest = Add-Control -Parent $tabRules -Type Label -X 320 -Y 106 -Width 380
-
-$updateTest = {
-    if (-not $txtTest.Text) { $lblTest.Text = ''; return }
-    try {
-        $ok = [regex]::IsMatch($txtTest.Text, $txtPattern.Text, 'IgnoreCase')
-        $lblTest.Text = if ($ok) { 'Conforme : aucune action' } else { 'Hors pattern : serait mis en quarantaine' }
-        $lblTest.ForeColor = if ($ok) { 'DarkGreen' } else { 'Firebrick' }
-    }
-    catch {
-        $lblTest.Text = 'Pattern invalide'
-        $lblTest.ForeColor = 'DarkOrange'
-    }
-}
-$txtPattern.Add_TextChanged($updateTest)
-$txtPattern.Add_TextChanged({ Update-StepState })
-$txtTest.Add_TextChanged($updateTest)
-
-[void](Add-Control -Parent $tabRules -Type Label -X 10 -Y 150 -Width 690 -Text 'OU de quarantaine (destination des comptes désactivés) :')
-$cmbQuar = Add-Control -Parent $tabRules -Type ComboBox -X 10 -Y 172 -Width 690 -Text $cfg.QuarantineOU
-$cmbQuar.Items.AddRange([object[]]$containers)
-$cmbQuar.AutoCompleteMode = 'SuggestAppend'
-$cmbQuar.AutoCompleteSource = 'ListItems'
-$cmbQuar.Add_TextChanged({ Update-StepState })
-
-$lblScope = Add-Control -Parent $tabRules -Type Label -X 10 -Y 215 -Width 690 -Height 60 -Text (
-    "Le contrôle porte sur tout le domaine, quel que soit l'emplacement du compte : les exceptions passent " +
-    "uniquement par le pattern et la liste blanche.`r`n" +
-    "L'OU de quarantaine est obligatoire pour le mode application ; son existence est vérifiée à l'enregistrement.")
-$lblScope.ForeColor = 'DimGray'
-
-#endregion
-
-#region Étape 3 : message du mail
+#region Étape 2 : message du mail
 
 # Modèles du module + « Aucun message » ; « Personnalisé » désigne un texte qui ne correspond à aucun modèle.
 # Le modèle affiché n'est pas enregistré : il est retrouvé en comparant le message de config.json aux modèles.
@@ -474,7 +468,7 @@ function Set-TemplateSelection {
     $script:LastTemplate = $Name
 }
 
-Add-StepIntro -Parent $tabMsg -Text ("Étape 3 - Rédigez le message de sensibilisation affiché en tête du mail d'alerte, " +
+Add-StepIntro -Parent $tabMsg -Text ("Étape 2 - Rédigez le message de sensibilisation affiché en tête de l'alerte de quarantaine, " +
     "au-dessus de la liste des comptes.")
 
 [void](Add-Control -Parent $tabMsg -Type Label -X 10 -Y 51 -Width 130 -Text 'Modèle :')
@@ -487,16 +481,12 @@ $txtMessage.Multiline = $true
 $txtMessage.AcceptsReturn = $true
 $txtMessage.WordWrap = $true
 $txtMessage.ScrollBars = 'Vertical'
-$script:TemplateSync = $true
-$txtMessage.Text = ([string]$cfg.MailMessage -replace "`r", '') -replace "`n", "`r`n"
-$script:TemplateSync = $false
-Set-TemplateSelection -Name (Get-MessageTemplateName -Text $txtMessage.Text)
 
 $lblMsgHint = Add-Control -Parent $tabMsg -Type Label -X 10 -Y 362 -Width 690 -Height 105 -Text (
     "Laissez vide pour ne pas afficher de message. Le texte est envoyé tel quel, sans mise en forme ; les sauts de ligne sont conservés.`r`n" +
     "En mode simulation, le mail précise en plus qu'aucune modification n'a été faite : évitez d'y affirmer que les comptes ont été désactivés " +
     "si vous testez longtemps en simulation.`r`n" +
-    "Le mail de test (étape 4) inclut ce message : il sert d'aperçu.")
+    "Les mails d'information (liste blanche modifiée, ajout autorisé) ont un texte fixe. Le mail de test (étape 3) inclut ce message.")
 $lblMsgHint.ForeColor = 'DimGray'
 
 # Choix d'un modèle : le texte est remplacé aussitôt. Seul un texte personnalisé demande confirmation avant d'être écrasé.
@@ -524,22 +514,21 @@ $txtMessage.Add_TextChanged({
 
 #endregion
 
-#region Étape 4 : notification
+#region Étape 3 : notification
 
-Add-StepIntro -Parent $tabMail -Text ("Étape 4 - Choisissez comment envoyer les alertes, puis envoyez un mail de test " +
-    "(il inclut le message de l'étape 3).")
+Add-StepIntro -Parent $tabMail -Text ("Étape 3 - Choisissez comment envoyer les alertes et les mails d'information, puis envoyez " +
+    "un mail de test (il inclut le message de l'étape 2).")
 
 $rbGraph = Add-Control -Parent $tabMail -Type RadioButton -X 10 -Y 48 -Width 300 -Text 'Microsoft 365 (Microsoft Graph)'
 $rbSmtp  = Add-Control -Parent $tabMail -Type RadioButton -X 320 -Y 48 -Width 300 -Text 'Serveur SMTP'
-$rbSmtp.Checked  = $cfg.Mail.Method -eq 'Smtp'
-$rbGraph.Checked = -not $rbSmtp.Checked
+$rbGraph.Checked = $true
 
 # Microsoft 365
 $pnlGraph = Add-Control -Parent $tabMail -Type Panel -X 0 -Y 80 -Width 710 -Height 140
 [void](Add-Control -Parent $pnlGraph -Type Label -X 10 -Y 3 -Width 180 -Text 'ID de locataire (tenant)')
-$txtTenant = Add-Control -Parent $pnlGraph -Type TextBox -X 195 -Y 0 -Width 505 -Text $cfg.Mail.TenantId
+$txtTenant = Add-Control -Parent $pnlGraph -Type TextBox -X 195 -Y 0 -Width 505
 [void](Add-Control -Parent $pnlGraph -Type Label -X 10 -Y 38 -Width 180 -Text "ID d'application (client)")
-$txtClient = Add-Control -Parent $pnlGraph -Type TextBox -X 195 -Y 35 -Width 505 -Text $cfg.Mail.ClientId
+$txtClient = Add-Control -Parent $pnlGraph -Type TextBox -X 195 -Y 35 -Width 505
 [void](Add-Control -Parent $pnlGraph -Type Label -X 10 -Y 73 -Width 180 -Text 'Secret client')
 $txtSecret = Add-SecretBox -Parent $pnlGraph -X 195 -Y 70 -Width 505
 $lblSecret = Add-Control -Parent $pnlGraph -Type Label -X 195 -Y 96 -Width 505
@@ -548,13 +537,12 @@ $lblSecret.ForeColor = 'DimGray'
 # SMTP
 $pnlSmtp = Add-Control -Parent $tabMail -Type Panel -X 0 -Y 80 -Width 710 -Height 140
 [void](Add-Control -Parent $pnlSmtp -Type Label -X 10 -Y 3 -Width 180 -Text 'Serveur SMTP')
-$txtSmtpServer = Add-Control -Parent $pnlSmtp -Type TextBox -X 195 -Y 0 -Width 340 -Text $cfg.Mail.SmtpServer
+$txtSmtpServer = Add-Control -Parent $pnlSmtp -Type TextBox -X 195 -Y 0 -Width 340
 [void](Add-Control -Parent $pnlSmtp -Type Label -X 555 -Y 3 -Width 40 -Text 'Port')
-$txtSmtpPort = Add-Control -Parent $pnlSmtp -Type TextBox -X 600 -Y 0 -Width 100 -Text ([string]$cfg.Mail.SmtpPort)
+$txtSmtpPort = Add-Control -Parent $pnlSmtp -Type TextBox -X 600 -Y 0 -Width 100
 $chkSmtpSsl = Add-Control -Parent $pnlSmtp -Type CheckBox -X 195 -Y 30 -Width 505 -Text 'Chiffrer la connexion (STARTTLS)'
-$chkSmtpSsl.Checked = [bool]$cfg.Mail.SmtpSsl
 [void](Add-Control -Parent $pnlSmtp -Type Label -X 10 -Y 63 -Width 180 -Text 'Utilisateur (facultatif)')
-$txtSmtpUser = Add-Control -Parent $pnlSmtp -Type TextBox -X 195 -Y 60 -Width 505 -Text $cfg.Mail.SmtpUser
+$txtSmtpUser = Add-Control -Parent $pnlSmtp -Type TextBox -X 195 -Y 60 -Width 505
 [void](Add-Control -Parent $pnlSmtp -Type Label -X 10 -Y 98 -Width 180 -Text 'Mot de passe')
 $txtSmtpPassword = Add-SecretBox -Parent $pnlSmtp -X 195 -Y 95 -Width 505
 $lblSmtpPassword = Add-Control -Parent $pnlSmtp -Type Label -X 195 -Y 121 -Width 505
@@ -562,21 +550,14 @@ $lblSmtpPassword.ForeColor = 'DimGray'
 
 # Commun
 [void](Add-Control -Parent $tabMail -Type Label -X 10 -Y 238 -Width 180 -Text 'Expéditeur')
-$txtFrom = Add-Control -Parent $tabMail -Type TextBox -X 195 -Y 235 -Width 505 -Text $cfg.Mail.From
+$txtFrom = Add-Control -Parent $tabMail -Type TextBox -X 195 -Y 235 -Width 505
 [void](Add-Control -Parent $tabMail -Type Label -X 10 -Y 273 -Width 180 -Text 'Destinataires (séparés par ;)')
-$txtTo = Add-Control -Parent $tabMail -Type TextBox -X 195 -Y 270 -Width 505 -Text $cfg.Mail.To
+$txtTo = Add-Control -Parent $tabMail -Type TextBox -X 195 -Y 270 -Width 505
 
 $lblMailHint = Add-Control -Parent $tabMail -Type Label -X 10 -Y 310 -Width 690 -Height 100
 $lblMailHint.ForeColor = 'DimGray'
 
 $btnTestMail = Add-Control -Parent $tabMail -Type Button -X 10 -Y 420 -Width 220 -Height 28 -Text 'Envoyer un mail de test'
-
-Update-SecretState
-Update-MailMethod
-$rbGraph.Add_CheckedChanged({ Update-MailMethod; Update-StepState })
-foreach ($box in @($txtTenant, $txtClient, $txtSecret, $txtSmtpServer, $txtSmtpPort, $txtSmtpUser, $txtSmtpPassword, $txtFrom, $txtTo)) {
-    $box.Add_TextChanged({ Update-StepState })
-}
 
 $btnTestMail.Add_Click({
     try {
@@ -593,33 +574,40 @@ $btnTestMail.Add_Click({
 
 #endregion
 
-#region Étape 5 : planification
+#region Étape 4 : planification
 
-Add-StepIntro -Parent $tabDeploy -Text ("Étape 5 - Installez la tâche planifiée sur ce contrôleur de domaine, d'abord en simulation, " +
-    "puis en application une fois les résultats vérifiés.")
+Add-StepIntro -Parent $tabDeploy -Text ("Étape 4 - Indiquez l'OU de quarantaine, puis installez la tâche planifiée sur ce contrôleur de " +
+    "domaine, d'abord en simulation. Exportez la configuration pour l'importer sur les autres DC.")
 
-$lblDeploy = Add-Control -Parent $tabDeploy -Type Label -X 10 -Y 48 -Width 690 -Height 92
+[void](Add-Control -Parent $tabDeploy -Type Label -X 10 -Y 48 -Width 690 -Text "OU de quarantaine (destination des comptes désactivés, obligatoire pour le mode application) :")
+$cmbQuar = Add-Control -Parent $tabDeploy -Type ComboBox -X 10 -Y 68 -Width 690
+$cmbQuar.Items.AddRange([object[]]$containers)
+$cmbQuar.AutoCompleteMode = 'SuggestAppend'
+$cmbQuar.AutoCompleteSource = 'ListItems'
+
+$lblDeploy = Add-Control -Parent $tabDeploy -Type Label -X 10 -Y 102 -Width 690 -Height 92
 Update-TaskState
 
-$btnInstall   = Add-Control -Parent $tabDeploy -Type Button -X 10 -Y 145 -Width 330 -Height 28 -Text 'Installer / mettre à jour la tâche planifiée'
-$btnUninstall = Add-Control -Parent $tabDeploy -Type Button -X 10 -Y 180 -Width 330 -Height 28 -Text 'Supprimer la tâche planifiée'
-$btnRunTest   = Add-Control -Parent $tabDeploy -Type Button -X 10 -Y 215 -Width 330 -Height 28 -Text 'Contrôler maintenant sans rien modifier (-WhatIf)'
-$btnRunTask   = Add-Control -Parent $tabDeploy -Type Button -X 10 -Y 250 -Width 330 -Height 28 -Text 'Exécuter la tâche maintenant (en SYSTEM)'
-$btnLogs      = Add-Control -Parent $tabDeploy -Type Button -X 10 -Y 285 -Width 330 -Height 28 -Text 'Ouvrir le dossier des journaux'
+$btnInstall   = Add-Control -Parent $tabDeploy -Type Button -X 10 -Y 198 -Width 330 -Height 28 -Text 'Installer / mettre à jour la tâche planifiée'
+$btnUninstall = Add-Control -Parent $tabDeploy -Type Button -X 10 -Y 231 -Width 330 -Height 28 -Text 'Supprimer la tâche planifiée'
+$btnRunTest   = Add-Control -Parent $tabDeploy -Type Button -X 10 -Y 264 -Width 330 -Height 28 -Text 'Contrôler maintenant sans rien modifier (-WhatIf)'
+$btnRunTask   = Add-Control -Parent $tabDeploy -Type Button -X 10 -Y 297 -Width 330 -Height 28 -Text 'Exécuter la tâche maintenant (en SYSTEM)'
+$btnLogs      = Add-Control -Parent $tabDeploy -Type Button -X 10 -Y 330 -Width 330 -Height 28 -Text 'Ouvrir le dossier des journaux'
 
-$lblAudit = Add-Control -Parent $tabDeploy -Type Label -X 355 -Y 145 -Width 345 -Height 135
-$btnAudit = Add-Control -Parent $tabDeploy -Type Button -X 355 -Y 285 -Width 200 -Height 28 -Text "Revérifier l'audit"
+$lblAudit = Add-Control -Parent $tabDeploy -Type Label -X 355 -Y 198 -Width 345 -Height 90
+$btnAudit = Add-Control -Parent $tabDeploy -Type Button -X 355 -Y 297 -Width 170 -Height 28 -Text "Revérifier l'audit"
+$btnExport = Add-Control -Parent $tabDeploy -Type Button -X 355 -Y 330 -Width 170 -Height 28 -Text 'Exporter la configuration'
+$btnImportCfg = Add-Control -Parent $tabDeploy -Type Button -X 530 -Y 330 -Width 170 -Height 28 -Text 'Importer une configuration'
 Update-AuditState
 
-$lblBlocked = Add-Control -Parent $tabDeploy -Type Label -X 10 -Y 322 -Width 690 -Height 20
+$lblBlocked = Add-Control -Parent $tabDeploy -Type Label -X 10 -Y 366 -Width 690 -Height 20
 $lblBlocked.ForeColor = 'Firebrick'
 
-$lblDeployHint = Add-Control -Parent $tabDeploy -Type Label -X 10 -Y 348 -Width 690 -Height 125 -Text (
-    "La tâche s'exécute en SYSTEM à chaque événement 4728 ou 4756 (ajout à un groupe global ou universel) du journal " +
-    "Sécurité de ce DC, et toutes les heures pour rattraper un ajout fait ailleurs. Installez-la sur chaque contrôleur de domaine.`r`n`r`n" +
-    "L'installation restreint les droits du dossier à SYSTEM et Administrateurs : un script modifiable par un tiers et exécuté " +
-    "en SYSTEM sur un DC serait une élévation de privilèges.`r`n`r`n" +
-    "Le contrôle « -WhatIf » ne modifie pas l'AD mais envoie le mail s'il trouve un compte hors pattern et hors liste blanche.")
+$lblDeployHint = Add-Control -Parent $tabDeploy -Type Label -X 10 -Y 390 -Width 690 -Height 85 -Text (
+    "La tâche s'exécute en SYSTEM à chaque événement 4728 ou 4756 du journal Sécurité de ce DC, et toutes les heures. " +
+    "Installez-la sur chaque contrôleur de domaine ; l'installation restreint les droits du dossier à SYSTEM et Administrateurs.`r`n" +
+    "L'export contient la configuration et la liste blanche, jamais les secrets : après un import, ressaisissez le secret " +
+    "à l'étape 3, puis Enregistrer.")
 $lblDeployHint.ForeColor = 'DimGray'
 
 $btnInstall.Add_Click({
@@ -628,11 +616,11 @@ $btnInstall.Add_Click({
     Update-AuditState
     if ($script:AuditState.Enabled -eq $false -and -not (Confirm-Action -Text ("L'audit « Gestion des groupes de sécurité » n'est pas actif en succès sur $env:COMPUTERNAME : " +
         "la tâche ne se déclenchera qu'au contrôle horaire. Installer quand même ?"))) { return }
-    if (-not (Test-MailReady) -and -not (Confirm-Action -Text "La notification (étape 4) n'est pas configurée : aucune alerte ne sera envoyée. Installer quand même ?")) { return }
+    if (-not (Test-MailReady) -and -not (Confirm-Action -Text "La notification (étape 3) n'est pas configurée : aucun mail ne sera envoyé. Installer quand même ?")) { return }
     # Choix explicite du mode à l'installation : la tâche lit config.json à chaque exécution
     $mode = Select-InstallMode
     if (-not $mode) { return }
-    if ($mode -eq 'Application' -and -not (Confirm-Action -Text 'Confirmer le mode APPLICATION : les comptes hors pattern et hors liste blanche seront mis en quarantaine automatiquement ?')) { return }
+    if ($mode -eq 'Application' -and -not (Confirm-Action -Text 'Confirmer le mode APPLICATION : les comptes hors liste blanche seront mis en quarantaine automatiquement ?')) { return }
     $previous = $script:SimulationMode
     $script:SimulationMode = $mode -eq 'Simulation'
     if (-not (Save-FormConfig)) { $script:SimulationMode = $previous; return }
@@ -670,7 +658,7 @@ $btnRunTask.Add_Click({
         Start-ScheduledTask -TaskName (Get-AdagTaskName)
         Update-TaskState
         Show-Message -Text ("Tâche lancée en SYSTEM, dans le mode enregistré dans config.json.`r`n" +
-            "Le résultat est dans le journal du jour (bouton « Ouvrir le dossier des journaux ») et, s'il y a un compte hors pattern et hors liste blanche, dans le mail.")
+            "Le résultat est dans le journal du jour (bouton « Ouvrir le dossier des journaux ») et, s'il y a lieu, dans les mails.")
     }
     catch { Show-Message -Text "Lancement impossible : $($_.Exception.Message)" -Icon Error }
 })
@@ -681,6 +669,35 @@ $btnLogs.Add_Click({
     $logs = Join-Path (Get-AdagRoot) 'logs'
     New-Item -ItemType Directory -Path $logs -Force | Out-Null
     Start-Process -FilePath 'explorer.exe' -ArgumentList "`"$logs`""
+})
+
+$btnExport.Add_Click({
+    $dlg = New-Object Windows.Forms.SaveFileDialog
+    $dlg.Filter = 'Export ADAdminGuard (*.json)|*.json'
+    $dlg.FileName = 'ADAdminGuard-export-{0}-{1:yyyyMMdd}.json' -f $env:COMPUTERNAME, (Get-Date)
+    if ($dlg.ShowDialog($form) -ne 'OK') { return }
+    try {
+        Export-AdagPackage -Path $dlg.FileName -Config (Get-FormConfig) -Whitelist @(Get-WhitelistEntry)
+        Show-Message -Text ("Configuration et liste blanche exportées, sans les secrets :`r`n$($dlg.FileName)`r`n`r`n" +
+            "Sur chaque autre DC : Importer une configuration, ressaisir le secret à l'étape 3, Enregistrer, puis installer la tâche.")
+    }
+    catch { Show-Message -Text "Export impossible : $($_.Exception.Message)" -Icon Error }
+})
+
+$btnImportCfg.Add_Click({
+    $dlg = New-Object Windows.Forms.OpenFileDialog
+    $dlg.Filter = 'Export ADAdminGuard (*.json)|*.json'
+    if ($dlg.ShowDialog($form) -ne 'OK') { return }
+    try {
+        $pkg = Import-AdagPackage -Path $dlg.FileName
+        if (-not (Confirm-Action -Text ("Remplacer la configuration affichée par celle exportée depuis $($pkg.Source) le $($pkg.ExportedAt) ?`r`n`r`n" +
+            "$($pkg.Whitelist.Count) compte(s) en liste blanche. Les secrets de ce DC sont conservés."))) { return }
+        Set-FormFromConfig -Config $pkg.Config -Whitelist $pkg.Whitelist
+        Update-StepState
+        Show-Message -Text ("Configuration importée, pas encore enregistrée.`r`nVérifiez les étapes, saisissez le secret à l'étape 3 " +
+            "si aucun n'est enregistré sur ce DC, puis cliquez sur Enregistrer.")
+    }
+    catch { Show-Message -Text "Import impossible : $($_.Exception.Message)" -Icon Error }
 })
 
 #endregion
@@ -707,6 +724,16 @@ if (-not $isAdmin) {
     $form.Add_Shown({ Show-Message -Text "Console non élevée : l'installation de la tâche et le contrôle immédiat demanderont une élévation." -Icon Warning })
 }
 
+#endregion
+
+#region Chargement de la configuration enregistrée
+
+Set-FormFromConfig -Config $cfg -Whitelist @(Get-AdagWhitelist)
+Update-SecretState
+$rbGraph.Add_CheckedChanged({ Update-MailMethod; Update-StepState })
+foreach ($box in @($txtTenant, $txtClient, $txtSecret, $txtSmtpServer, $txtSmtpPort, $txtSmtpUser, $txtSmtpPassword, $txtFrom, $txtTo)) {
+    $box.Add_TextChanged({ Update-StepState })
+}
 $script:UiReady = $true
 Update-StepState
 

@@ -2,8 +2,9 @@
 <#
     Fonctions communes à Invoke-ADAdminGuard.ps1 (contrôle) et Show-ADAdminGuardConfig.ps1 (configurateur).
     Fichiers gérés, tous à la racine du dossier du script :
-      config.json   : paramètres (pattern, groupes, OU de quarantaine, mail, secret chiffré DPAPI machine)
-      whitelist.txt : comptes exclus du contrôle, un sAMAccountName par ligne
+      config.json   : paramètres (groupes, OU de quarantaine, mail, secrets chiffrés DPAPI machine)
+      whitelist.txt : comptes autorisés, une ligne « sAMAccountName;SID » par compte
+      state.json    : état entre deux exécutions (dernier événement traité, liste blanche vue), propre au DC
 #>
 
 Set-StrictMode -Version Latest
@@ -13,6 +14,7 @@ Add-Type -AssemblyName System.Security
 $script:Root          = $PSScriptRoot
 $script:ConfigPath    = Join-Path $PSScriptRoot 'config.json'
 $script:WhitelistPath = Join-Path $PSScriptRoot 'whitelist.txt'
+$script:StatePath     = Join-Path $PSScriptRoot 'state.json'
 $script:TaskName      = 'ADAdminGuard'
 $script:EventSource   = 'ADAdminGuard'
 # Entropie ajoutée au chiffrement DPAPI : le secret ne se déchiffre pas par un simple appel sans elle
@@ -55,7 +57,6 @@ function Get-AdagEventSource { $script:EventSource }
 
 function New-AdagDefaultConfig {
     [pscustomobject]@{
-        Pattern        = '^adm-'
         Groups         = @('DomainAdmins', 'EnterpriseAdmins', 'SchemaAdmins')
         QuarantineOU   = ''
         SimulationMode = $true
@@ -104,11 +105,6 @@ function Test-AdagConfig {
     # Renvoie la liste des problèmes bloquants (vide si la configuration est utilisable)
     param([Parameter(Mandatory)] $Config)
     $problems = @()
-    if (-not $Config.Pattern) { $problems += 'Le pattern est vide.' }
-    else {
-        try { [void][regex]::new($Config.Pattern) }
-        catch { $problems += "Pattern invalide : $($_.Exception.GetBaseException().Message)" }
-    }
     if (@($Config.Groups).Count -eq 0) { $problems += 'Aucun groupe surveillé.' }
     foreach ($g in @($Config.Groups)) {
         if (-not $script:GroupDefinitions.Contains($g)) { $problems += "Groupe inconnu : $g." }
@@ -135,21 +131,85 @@ function Test-AdagMailConfigured {
 #region Liste blanche
 
 function Get-AdagWhitelist {
+    # Entrées { Name; Sid }. Une ligne sans SID (ancien format ou compte introuvable) est comparée sur le nom seul.
     if (-not (Test-Path -LiteralPath $script:WhitelistPath)) { return @() }
-    @(Get-Content -LiteralPath $script:WhitelistPath -Encoding UTF8 |
-        ForEach-Object { ($_ -replace '#.*$', '').Trim() } |
-        Where-Object { $_ })
+    foreach ($line in Get-Content -LiteralPath $script:WhitelistPath -Encoding UTF8) {
+        $line = ($line -replace '#.*$', '').Trim()
+        if (-not $line) { continue }
+        $parts = $line -split ';', 2
+        [pscustomobject]@{ Name = $parts[0].Trim(); Sid = if ($parts.Count -gt 1) { $parts[1].Trim() } else { '' } }
+    }
 }
 
 function Save-AdagWhitelist {
     [CmdletBinding(SupportsShouldProcess)]
-    param([AllowEmptyCollection()][string[]]$Name = @())
+    param([AllowEmptyCollection()][object[]]$Entry = @())
     $header = @(
-        '# Comptes exclus du contrôle ADAdminGuard : un sAMAccountName par ligne, # = commentaire.'
+        '# Comptes autorisés dans les groupes surveillés par ADAdminGuard : « sAMAccountName;SID », # = commentaire.'
+        '# Le SID fait foi : renommer un compte ne permet pas de se faire passer pour un compte autorisé.'
         "# Mis à jour le $(Get-Date -Format 'yyyy-MM-dd HH:mm') par $env:USERDOMAIN\$env:USERNAME"
     )
+    $lines = @($Entry | Sort-Object -Property Name -Unique | ForEach-Object { if ($_.Sid) { "$($_.Name);$($_.Sid)" } else { $_.Name } })
     if ($PSCmdlet.ShouldProcess($script:WhitelistPath, 'Enregistrer la liste blanche')) {
-        Set-Content -LiteralPath $script:WhitelistPath -Value ($header + @($Name | Sort-Object -Unique)) -Encoding UTF8
+        Set-Content -LiteralPath $script:WhitelistPath -Value ($header + $lines) -Encoding UTF8
+    }
+}
+
+function Test-AdagAuthorized {
+    # Compte admis dans un groupe surveillé : Administrateur intégré (RID 500) ou présent dans la liste blanche.
+    # Comparaison sur le SID quand l'entrée en a un, sinon sur le nom.
+    param([Parameter(Mandatory)] $Member, [AllowEmptyCollection()][object[]]$Whitelist = @())
+    if ($Member.Sid -like '*-500') { return $true }
+    foreach ($w in $Whitelist) {
+        if ($w.Sid) { if ($Member.Sid -and $w.Sid -eq $Member.Sid) { return $true } }
+        elseif ($Member.SamAccountName -and $w.Name -eq $Member.SamAccountName) { return $true }
+    }
+    $false
+}
+
+#endregion
+
+#region État entre deux exécutions et export / import
+
+function Get-AdagState {
+    if (-not (Test-Path -LiteralPath $script:StatePath)) { return $null }
+    Get-Content -LiteralPath $script:StatePath -Raw -Encoding UTF8 | ConvertFrom-Json
+}
+
+function Save-AdagState {
+    [CmdletBinding(SupportsShouldProcess)]
+    param([Parameter(Mandatory)] $State)
+    if ($PSCmdlet.ShouldProcess($script:StatePath, "Enregistrer l'état")) {
+        $State | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $script:StatePath -Encoding UTF8
+    }
+}
+
+function Export-AdagPackage {
+    # Configuration et liste blanche dans un fichier, SANS les secrets : à importer sur les autres DC
+    param([Parameter(Mandatory)][string]$Path, [Parameter(Mandatory)] $Config, [AllowEmptyCollection()][object[]]$Whitelist = @())
+    $c = $Config | ConvertTo-Json -Depth 5 | ConvertFrom-Json
+    $c.Mail.SecretProtected = ''
+    $c.Mail.SmtpPasswordProtected = ''
+    [pscustomobject]@{
+        Product    = 'ADAdminGuard'
+        ExportedAt = (Get-Date).ToString('s')
+        ExportedBy = "$env:USERDOMAIN\$env:USERNAME"
+        Source     = $env:COMPUTERNAME
+        Config     = $c
+        Whitelist  = @($Whitelist | Select-Object -Property Name, Sid)
+    } | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $Path -Encoding UTF8
+}
+
+function Import-AdagPackage {
+    # Lit un export ; renvoie { Config; Whitelist; Source; ExportedAt }. Les secrets ne sont pas dans l'export.
+    param([Parameter(Mandatory)][string]$Path)
+    $p = Get-Content -LiteralPath $Path -Raw -Encoding UTF8 | ConvertFrom-Json
+    if (-not $p.PSObject.Properties['Product'] -or $p.Product -ne 'ADAdminGuard') { throw "Ce fichier n'est pas un export ADAdminGuard." }
+    [pscustomobject]@{
+        Config     = $p.Config
+        Whitelist  = @($p.Whitelist | Where-Object { $_ } | ForEach-Object { [pscustomobject]@{ Name = [string]$_.Name; Sid = [string]$_.Sid } })
+        Source     = [string]$p.Source
+        ExportedAt = [string]$p.ExportedAt
     }
 }
 
@@ -358,11 +418,13 @@ function Get-AdagEffectiveMember {
     # Un groupe déjà parcouru n'est pas relu : les imbrications circulaires ne bouclent pas.
     param([Parameter(Mandatory)] $GroupInfo)
     $rootDN  = [string]$GroupInfo.Group.DistinguishedName
+    $rootSid = $GroupInfo.Group.PSObject.Properties['SID']
+    $rootSid = if ($rootSid -and $rootSid.Value) { [string]$rootSid.Value } else { '' }
     $visited = New-Object 'System.Collections.Generic.HashSet[string]' -ArgumentList ([StringComparer]::OrdinalIgnoreCase)
     [void]$visited.Add($rootDN)
     $pending = New-Object System.Collections.Queue
     $pending.Enqueue([pscustomobject]@{
-        DN = $rootDN; Name = $GroupInfo.Label; Server = $GroupInfo.Server; Path = $GroupInfo.Label
+        DN = $rootDN; Sid = $rootSid; Name = $GroupInfo.Label; Server = $GroupInfo.Server; Path = $GroupInfo.Label
         Members = @($GroupInfo.Group.member | ForEach-Object { [string]$_ })
     })
 
@@ -373,6 +435,7 @@ function Get-AdagEffectiveMember {
             [pscustomobject]@{
                 Member       = $m
                 ParentDN     = $parent.DN
+                ParentSid    = $parent.Sid
                 ParentName   = $parent.Name
                 ParentServer = $parent.Server
                 Path         = $parent.Path
@@ -381,7 +444,7 @@ function Get-AdagEffectiveMember {
             if ($m.ObjectClass -eq 'group' -and $visited.Add($m.DistinguishedName)) {
                 $name = if ($m.SamAccountName) { $m.SamAccountName } else { $m.DistinguishedName }
                 $pending.Enqueue([pscustomobject]@{
-                    DN = $m.DistinguishedName; Name = $name; Path = "$($parent.Path) > $name"; Members = $m.Members
+                    DN = $m.DistinguishedName; Sid = $m.Sid; Name = $name; Path = "$($parent.Path) > $name"; Members = $m.Members
                     Server = Get-AdagDomainFromDN -DistinguishedName $m.DistinguishedName
                 })
             }
@@ -412,6 +475,7 @@ function Get-AdagAddEvent {
         $data = @{}
         foreach ($d in ([xml]$e.ToXml()).Event.EventData.Data) { $data[$d.Name] = $d.InnerText }
         [pscustomobject]@{
+            RecordId  = [long]$e.RecordId
             Time      = $e.TimeCreated
             Computer  = ($e.MachineName -split '\.')[0]
             MemberSid = ([string]$data['MemberSid']) -replace '^%\{|\}$', ''
@@ -507,7 +571,7 @@ function Register-AdagTask {
     if ($PSCmdlet.ShouldProcess($script:TaskName, 'Créer ou mettre à jour la tâche planifiée')) {
         Register-ScheduledTask -TaskName $script:TaskName -TaskPath '\' -Action $action -Trigger @($eventTrigger, $sweepTrigger) `
             -Principal $principal -Settings $settings -Force `
-            -Description 'Met en quarantaine les comptes hors pattern et hors liste blanche ajoutés aux groupes Admins du domaine / entreprise / schéma.' | Out-Null
+            -Description 'Met en quarantaine les comptes hors liste blanche ajoutés aux groupes Admins du domaine / entreprise / schéma.' | Out-Null
     }
 }
 

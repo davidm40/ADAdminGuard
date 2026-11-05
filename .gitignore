@@ -1,4 +1,6 @@
 # Fichiers propres à chaque contrôleur de domaine : jamais versionnés
 config.json
 whitelist.txt
+state.json
+*-export-*.json
 logs/
