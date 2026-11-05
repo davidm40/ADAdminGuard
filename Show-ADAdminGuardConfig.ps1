@@ -102,6 +102,7 @@ function Select-InstallMode {
     $dlg.MaximizeBox = $false
     $dlg.ShowInTaskbar = $false
     $dlg.Font = $form.Font
+    $dlg.Icon = $form.Icon
 
     $icon = Add-Control -Parent $dlg -Type PictureBox -X 15 -Y 15 -Width 32 -Height 32
     $icon.Image = [Drawing.SystemIcons]::Question.ToBitmap()
@@ -349,8 +350,11 @@ $form.StartPosition = 'CenterScreen'
 $form.FormBorderStyle = 'FixedDialog'
 $form.MaximizeBox = $false
 $form.Font = New-Object Drawing.Font('Segoe UI', 9)
+# Logo dans la barre de titre et la barre des tâches (facultatif : sans le fichier, icône par défaut)
+$iconPath = Join-Path $PSScriptRoot 'ADAdminGuard.ico'
+if (Test-Path -LiteralPath $iconPath) { $form.Icon = New-Object Drawing.Icon($iconPath) }
 
-$tabs = Add-Control -Parent $form -Type TabControl -X 10 -Y 10 -Width 720 -Height 515
+$tabs =Add-Control -Parent $form -Type TabControl -X 10 -Y 10 -Width 720 -Height 515
 $tabWhite  = New-Object Windows.Forms.TabPage
 $tabMsg    = New-Object Windows.Forms.TabPage
 $tabMail   = New-Object Windows.Forms.TabPage
