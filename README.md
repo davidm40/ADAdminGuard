@@ -1,6 +1,4 @@
-<img src="docs/images/logo.svg" width="120" align="left" alt="Logo ADAdminGuard : un bouclier qui protège un groupe de comptes, dont un est refusé">
-
-# ADAdminGuard
+<h1><img src="docs/images/logo.svg" width="64" align="absmiddle" alt="Logo ADAdminGuard : un bouclier qui protège un groupe de comptes, dont un est refusé"> ADAdminGuard</h1>
 
 Garde-fou pour les groupes à privilèges d'Active Directory. Seuls les comptes d'une **liste blanche** (et le compte
 **Administrateur intégré**) peuvent être membres des groupes **Admins du domaine**, **Administrateurs de
