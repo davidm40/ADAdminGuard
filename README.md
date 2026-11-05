@@ -6,7 +6,8 @@ groupe imbriqué, PrivAdminGuard vérifie qu'il respecte la convention de nommag
 ou qu'il figure dans une liste blanche. Sinon, il le met en quarantaine et prévient par mail.
 
 Le contrôle tourne sur chaque contrôleur de domaine, en tâche planifiée SYSTEM, déclenchée par les événements
-de sécurité 4728 / 4756 et rejouée toutes les heures. Un configurateur graphique (WinForms) règle l'ensemble.
+de sécurité 4728 / 4756 et rejouée toutes les heures. Un configurateur graphique (WinForms) guide la mise en place
+en cinq étapes. Les alertes partent par Microsoft 365 (Graph) ou par un serveur SMTP classique.
 
 > **Ce que PrivAdminGuard est, et n'est pas.** C'est un contrôle de conformité et un détecteur rapide : il fait
 > respecter la convention de nommage et signale tout ajout non prévu. Ce n'est pas une barrière contre un
@@ -23,6 +24,7 @@ de sécurité 4728 / 4756 et rejouée toutes les heures. Un configurateur graphi
 - [Installation](#installation)
 - [Configuration](#configuration)
 - [Application Entra ID pour l'envoi des mails](#application-entra-id-pour-lenvoi-des-mails)
+- [Envoi par serveur SMTP](#envoi-par-serveur-smtp)
 - [Mise en service conseillée](#mise-en-service-conseillée)
 - [Journalisation](#journalisation)
 - [Exécution manuelle](#exécution-manuelle)
@@ -103,8 +105,8 @@ moins la date et le DC à consulter.
 
 ### Mail d'alerte
 
-Un mail récapitulatif est envoyé via **Microsoft Graph** à chaque exécution qui trouve au moins un compte non
-conforme. Il contient :
+Un mail récapitulatif est envoyé, via **Microsoft Graph** ou un **serveur SMTP**, à chaque exécution qui trouve au
+moins un compte non conforme. Il contient :
 
 - un **message de sensibilisation** personnalisable, encadré en tête ;
 - pour chaque compte : nom, DN, **chemin d'appartenance** (ex. `Administrateurs de l'entreprise > G-Tier0-Admins > jdupont`),
@@ -123,8 +125,8 @@ conforme. Il contient :
 | Module | `ActiveDirectory` (présent sur un DC) |
 | Droits | Administrateur du DC pour installer la tâche ; la tâche tourne ensuite en SYSTEM |
 | Audit | **Auditer la gestion des groupes de sécurité : Succès** (stratégie d'audit avancée) |
-| Mail | Une application Entra ID avec la permission Graph **Mail.Send** (application) et une boîte expéditrice |
-| Réseau | Accès HTTPS sortant du DC vers `login.microsoftonline.com` et `graph.microsoft.com` |
+| Mail, au choix | **Microsoft 365** : une application Entra ID avec la permission Graph **Mail.Send** (application) et une boîte expéditrice<br>**SMTP** : un serveur ou relais SMTP joignable depuis le DC |
+| Réseau | Microsoft 365 : HTTPS sortant vers `login.microsoftonline.com` et `graph.microsoft.com`<br>SMTP : accès au serveur sur le port choisi (587 ou 25) |
 
 ### Activer l'audit
 
@@ -133,8 +135,8 @@ Par GPO liée à l'OU **Domain Controllers** :
 `Configuration ordinateur > Stratégies > Paramètres Windows > Paramètres de sécurité > Configuration avancée de la
 stratégie d'audit > Gestion des comptes > Auditer la gestion des groupes de sécurité` : **Succès**.
 
-Sans cet audit, la tâche ne réagit qu'au contrôle horaire et l'auteur de l'ajout reste inconnu. L'onglet
-**Déploiement** du configurateur affiche l'état effectif de l'audit sur le DC.
+Sans cet audit, la tâche ne réagit qu'au contrôle horaire et l'auteur de l'ajout reste inconnu. L'étape
+**5. Planification** du configurateur affiche l'état effectif de l'audit sur le DC.
 
 ---
 
@@ -142,8 +144,8 @@ Sans cet audit, la tâche ne réagit qu'au contrôle horaire et l'auteur de l'aj
 
 1. Copier le dossier sur **chaque contrôleur de domaine**, par exemple dans `C:\Scripts\PrivAdminGuard`.
 2. Lancer **`Configurer-PrivAdminGuard.bat`** : il demande l'élévation si nécessaire, puis ouvre le configurateur.
-3. Renseigner les onglets (voir [Configuration](#configuration)), puis cliquer sur **Enregistrer**.
-4. Onglet **Déploiement** > **Installer / mettre à jour la tâche planifiée**, puis choisir **Simulation** ou
+3. Suivre les étapes 1 à 4 du configurateur (voir [Configuration](#configuration)), puis cliquer sur **Enregistrer**.
+4. Étape **5. Planification** > **Installer / mettre à jour la tâche planifiée**, puis choisir **Simulation** ou
    **Application**.
 
 L'installation :
@@ -152,46 +154,43 @@ L'installation :
 - crée la source d'événements `PrivAdminGuard` dans le journal Application ;
 - **restreint les droits du dossier à SYSTEM et Administrateurs** (voir [Sécurité](#sécurité)).
 
-La configuration est **propre à chaque DC** : le secret client est chiffré pour la machine (DPAPI). Il faut donc
-ouvrir le configurateur et enregistrer sur chaque DC, ou y ressaisir le secret après copie de `config.json`.
+La configuration est **propre à chaque DC** : le secret client et le mot de passe SMTP sont chiffrés pour la
+machine (DPAPI). Il faut donc ouvrir le configurateur et enregistrer sur chaque DC, ou y ressaisir le secret après
+copie de `config.json`.
 
 ---
 
 ## Configuration
 
-Le configurateur `Show-PrivAdminGuardConfig.ps1` (lancé par le `.bat`) comporte cinq onglets.
+Le configurateur `Show-PrivAdminGuardConfig.ps1` (lancé par le `.bat`) guide la mise en place en **cinq étapes
+numérotées**, parcourues avec **Précédent / Suivant** ou directement par les onglets. Une coche ✓ marque chaque
+étape terminée et un compteur indique la progression. L'installation de la tâche reste **bloquée tant que les
+étapes 1 et 2 ne sont pas faites**. **Enregistrer** écrit `config.json` et `whitelist.txt` à tout moment.
 
-### Règles
+### Étape 1 : liste blanche
 
-| Champ | Description |
+Recensement des comptes à privilèges existants, qui seront exclus du contrôle.
+
+| Élément | Description |
 |---|---|
-| **Pattern** | Expression régulière que doit respecter le `sAMAccountName` des comptes à privilèges, ex. `^adm-t0-`. Un champ de test indique si un nom serait conforme. |
 | **Groupes surveillés** | Admins du domaine, Administrateurs de l'entreprise, Administrateurs du schéma. |
-| **OU de quarantaine** | Destination des comptes désactivés. Obligatoire en mode application ; son existence est vérifiée à l'enregistrement. |
-| **Mode simulation** | Coché : aucune modification de l'AD. |
+| **Importer les membres actuels des groupes cochés** | Ajoute tous les membres, directs et imbriqués (groupes imbriqués compris). |
+| **Liste** | Comptes et groupes exclus, un `sAMAccountName` par ligne, enregistrés dans `whitelist.txt`. Ajout manuel et retrait possibles. |
 
-### Liste blanche
+À faire **avant toute mise en service** : un compte existant hors pattern et absent de la liste serait mis en
+quarantaine. Par sécurité, le contrôle **refuse de s'exécuter tant que `whitelist.txt` n'existe pas**.
+Terminée quand au moins un groupe est coché et la liste n'est pas vide.
 
-Comptes et groupes exclus du contrôle, un `sAMAccountName` par ligne, enregistrés dans `whitelist.txt`.
-
-**Importer les membres actuels** ajoute tous les membres, directs et imbriqués, des groupes cochés. À faire
-**avant toute mise en service** : un compte existant hors pattern et absent de la liste serait mis en quarantaine.
-Par sécurité, le contrôle **refuse de s'exécuter tant que `whitelist.txt` n'existe pas**.
-
-### Notification
+### Étape 2 : pattern
 
 | Champ | Description |
 |---|---|
-| **ID de locataire** | GUID du locataire Entra ID, ou son nom de domaine. |
-| **ID d'application (client)** | GUID de l'application (page *Vue d'ensemble*). |
-| **Secret client** | *Valeur* du secret (pas son ID). Affiché en points une fois enregistré ; saisir une nouvelle valeur pour le remplacer. |
-| **Boîte expéditrice** | Adresse de la boîte qui envoie les alertes. |
-| **Destinataires** | Adresses séparées par `;`. |
+| **Pattern** | Expression régulière que doit respecter le `sAMAccountName` des nouveaux comptes à privilèges, ex. `^adm-t0-`. Un champ de test indique si un nom serait conforme. |
+| **OU de quarantaine** | Destination des comptes désactivés. Obligatoire en mode application ; son existence est vérifiée à l'enregistrement. |
 
-**Envoyer un mail de test** envoie un mail avec le message de sensibilisation, pour aperçu. En cas d'échec, le
-message affiche le motif renvoyé par Entra ID ou Graph (`AADSTS…`, permission manquante, boîte introuvable…).
+Terminée quand le pattern est valide et l'OU de quarantaine renseignée.
 
-### Message du mail
+### Étape 3 : message
 
 Texte de sensibilisation affiché en tête du mail d'alerte. Quatre modèles sont proposés : *Rappel de la
 politique* (par défaut), *Sensibilisation*, *Alerte sécurité* et *Court*. Choisir un modèle remplace le texte
@@ -201,18 +200,47 @@ aussitôt ; *Aucun message* supprime l'encadré ; toute modification à la main 
 Les modèles affirment que les comptes « ont été désactivés » : en simulation prolongée, adapter le texte (le mail
 précise de toute façon qu'aucune modification n'a été faite).
 
-### Déploiement
+### Étape 4 : notification
+
+Choix de la méthode d'envoi, puis paramètres communs.
+
+**Microsoft 365 (Microsoft Graph)** — voir [Application Entra ID](#application-entra-id-pour-lenvoi-des-mails) :
+
+| Champ | Description |
+|---|---|
+| **ID de locataire** | GUID du locataire Entra ID, ou son nom de domaine. |
+| **ID d'application (client)** | GUID de l'application (page *Vue d'ensemble*). |
+| **Secret client** | *Valeur* du secret (pas son ID). |
+
+**Serveur SMTP** — voir [Envoi par serveur SMTP](#envoi-par-serveur-smtp) :
+
+| Champ | Description |
+|---|---|
+| **Serveur SMTP / Port** | Nom ou adresse du serveur, port 587 (soumission) ou 25 (relais). |
+| **Chiffrer la connexion (STARTTLS)** | Recommandé. Le SSL implicite (port 465) n'est pas pris en charge. |
+| **Utilisateur** | Facultatif : vide pour un relais anonyme autorisé par adresse IP. |
+| **Mot de passe** | Requis si un utilisateur est saisi. |
+
+**Communs** : **Expéditeur** et **Destinataires** (séparés par `;`).
+
+Les secrets (secret client, mot de passe SMTP) sont affichés en points une fois enregistrés ; saisir une nouvelle
+valeur pour les remplacer. **Envoyer un mail de test** envoie un mail avec le message de l'étape 3, pour aperçu.
+En cas d'échec, le message affiche la cause : motif Entra ID / Graph (`AADSTS…`, permission manquante…) ou
+erreur du serveur SMTP. Terminée quand les champs de la méthode choisie sont remplis.
+
+### Étape 5 : planification
 
 | Bouton | Effet |
 |---|---|
-| **Installer / mettre à jour la tâche planifiée** | Enregistre la configuration, demande le mode (Simulation / Application), installe la tâche. |
+| **Installer / mettre à jour la tâche planifiée** | Enregistre la configuration, demande le mode (**Simulation** / **Application**), installe la tâche. Prévient si l'audit est inactif ou la notification non configurée. |
 | **Supprimer la tâche planifiée** | Désinstalle la tâche sur ce DC. |
 | **Contrôler maintenant sans rien modifier (-WhatIf)** | Lance le contrôle dans une console, avec le compte courant. Le mail est envoyé s'il y a un compte non conforme. |
 | **Exécuter la tâche maintenant (en SYSTEM)** | Lance la vraie tâche planifiée : test le plus fidèle d'un déclenchement automatique. |
 | **Ouvrir le dossier des journaux** | Ouvre `logs\`. |
 | **Revérifier l'audit** | Relit l'état effectif de l'audit « Gestion des groupes de sécurité ». |
 
-L'onglet affiche aussi l'état de la tâche, le mode enregistré et l'état de l'audit.
+L'étape affiche aussi l'état de la tâche, le mode enregistré et l'état de l'audit. Terminée quand la tâche est
+installée.
 
 ### Fichier `config.json`
 
@@ -224,17 +252,24 @@ L'onglet affiche aussi l'état de la tâche, le mode enregistré et l'état de l
   "SimulationMode": true,
   "MailMessage": "Les comptes ci-dessous …",
   "Mail": {
+    "Method": "Graph",
     "TenantId": "00000000-0000-0000-0000-000000000000",
     "ClientId": "00000000-0000-0000-0000-000000000000",
     "SecretProtected": "<secret chiffré DPAPI, propre à la machine>",
+    "SmtpServer": "",
+    "SmtpPort": 587,
+    "SmtpSsl": true,
+    "SmtpUser": "",
+    "SmtpPasswordProtected": "",
     "From": "alertes-ad@contoso.com",
     "To": "secops@contoso.com;admin@contoso.com"
   }
 }
 ```
 
----
+`Method` vaut `Graph` (Microsoft 365) ou `Smtp`.
 
+---
 ## Application Entra ID pour l'envoi des mails
 
 1. **Entra ID > Inscriptions d'applications > Nouvelle inscription** (compte unique du locataire, sans URI de redirection).
@@ -259,11 +294,27 @@ dans le journal du script et dans le journal Application (ID 1002).
 
 ---
 
+## Envoi par serveur SMTP
+
+Pour les environnements sans Microsoft 365 : relais SMTP interne (Exchange, Postfix…) ou serveur de messagerie
+d'un fournisseur.
+
+- **Relais interne anonyme** : port 25, utilisateur vide. Autoriser le relais depuis l'adresse IP de chaque DC sur
+  le serveur SMTP.
+- **Serveur authentifié** : port 587, STARTTLS coché, utilisateur et mot de passe d'une boîte dédiée aux alertes.
+- Le **SSL implicite (port 465)** n'est pas pris en charge par le client SMTP de .NET : utiliser 587 avec STARTTLS.
+- Le mot de passe est chiffré avec DPAPI pour la machine, comme le secret client.
+
+L'envoi SMTP de Microsoft 365 (`smtp.office365.com`) en authentification de base est en cours de retrait par
+Microsoft : avec un locataire Microsoft 365, préférer la méthode Graph.
+
+---
+
 ## Mise en service conseillée
 
-1. Activer l'audit sur les DC et vérifier qu'il apparaît en vert dans l'onglet **Déploiement**.
-2. Sur chaque DC : configurer, **importer les membres actuels** dans la liste blanche, enregistrer.
-3. **Envoyer un mail de test.**
+1. Activer l'audit sur les DC et vérifier qu'il apparaît en vert à l'étape **5. Planification**.
+2. Sur chaque DC : suivre les étapes 1 à 4 du configurateur (**importer les membres actuels** dans la liste blanche), enregistrer.
+3. **Envoyer un mail de test** (étape 4).
 4. Installer la tâche en **Simulation**.
 5. Ajouter un compte de test hors pattern à *Admins du domaine* : vérifier le mail (chemin d'appartenance,
    auteur, actions prévues) et le journal.
@@ -306,8 +357,8 @@ dans le journal Application.
 - **Droits du dossier.** Le script s'exécute en SYSTEM sur un contrôleur de domaine : quiconque pourrait le
   modifier obtiendrait ces droits. L'installation retire l'héritage et limite le dossier à SYSTEM et Administrateurs.
   Ne pas placer le dossier sur un partage.
-- **Secret client.** Chiffré avec DPAPI en portée machine : lisible uniquement sur le DC qui l'a enregistré, jamais
-  stocké en clair, jamais affiché par le configurateur.
+- **Secret client et mot de passe SMTP.** Chiffrés avec DPAPI en portée machine : lisibles uniquement sur le DC qui
+  les a enregistrés, jamais stockés en clair, jamais affichés par le configurateur.
 - **Pattern.** Absent du mail et du journal Application. Le connaître facilite le contournement du contrôle.
 - **Liste blanche.** À tenir courte et à revoir régulièrement : chaque entrée est un compte qui échappe au contrôle.
 - **Mode simulation par défaut**, et refus de fonctionner sans liste blanche : une mauvaise configuration ne peut
@@ -336,12 +387,14 @@ dans le journal Application.
 
 | Symptôme | Cause probable |
 |---|---|
-| `whitelist.txt absent` dans le journal | Importer les membres actuels dans l'onglet Liste blanche, puis Enregistrer. |
+| `whitelist.txt absent` dans le journal | Importer les membres actuels à l'étape 1, puis Enregistrer. |
 | « Ajouté par » inconnu | Audit inactif sur le DC, ajout traité par un autre DC, ou journal Sécurité illisible : le journal du script précise le cas (nombre d'événements lus, DC d'origine, SID vus). |
 | `AADSTS7000215` / `invalid_client` | Secret erroné : saisir la *Valeur* du secret, pas son ID. |
 | `AADSTS700016` | ID d'application erroné ou application d'un autre locataire. |
 | `ErrorAccessDenied` à l'envoi | Permission `Mail.Send` absente, consentement non accordé, ou boîte expéditrice hors du périmètre RBAC. |
-| `Secret illisible sur <DC>` | `config.json` copié depuis une autre machine : ressaisir le secret sur ce DC. |
+| `Envoi SMTP via … : refusée` / délai dépassé | Serveur ou port injoignable depuis le DC (pare-feu), ou mauvais port. |
+| `5.7.1` / relais refusé | Relais anonyme non autorisé pour l'adresse IP du DC, ou authentification requise. |
+| `Secret illisible sur <DC>` | `config.json` copié depuis une autre machine : ressaisir le secret client ou le mot de passe SMTP sur ce DC. |
 | Audit « non vérifiable » | Configurateur lancé sans élévation : passer par `Configurer-PrivAdminGuard.bat`. |
 
 ---
@@ -351,9 +404,9 @@ dans le journal Application.
 | Fichier | Rôle |
 |---|---|
 | `Configurer-PrivAdminGuard.bat` | Lanceur du configurateur, avec élévation automatique. |
-| `Show-PrivAdminGuardConfig.ps1` | Configurateur graphique. |
+| `Show-PrivAdminGuardConfig.ps1` | Configurateur graphique en cinq étapes. |
 | `Invoke-PrivAdminGuard.ps1` | Contrôle, exécuté par la tâche planifiée. |
-| `PrivAdminGuard.psm1` | Fonctions communes : configuration, liste blanche, secret, Graph, AD, tâche planifiée. |
+| `PrivAdminGuard.psm1` | Fonctions communes : configuration, liste blanche, secrets, envoi Graph et SMTP, AD, tâche planifiée. |
 | `config.json` | Configuration, créée par le configurateur (non versionnée). |
 | `whitelist.txt` | Liste blanche, créée par le configurateur (non versionnée). |
 | `logs\` | Journaux quotidiens (non versionnés). |

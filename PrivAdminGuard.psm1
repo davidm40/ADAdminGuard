@@ -61,11 +61,17 @@ function New-PagDefaultConfig {
         SimulationMode = $true
         MailMessage    = $script:MailTemplates['Rappel de la politique']
         Mail           = [pscustomobject]@{
-            TenantId        = ''
-            ClientId        = ''
-            SecretProtected = ''
-            From            = ''
-            To              = ''
+            Method                = 'Graph'   # 'Graph' (Microsoft 365) ou 'Smtp'
+            TenantId              = ''
+            ClientId              = ''
+            SecretProtected       = ''
+            SmtpServer            = ''
+            SmtpPort              = 587
+            SmtpSsl               = $true     # STARTTLS
+            SmtpUser              = ''        # vide = relais anonyme
+            SmtpPasswordProtected = ''
+            From                  = ''
+            To                    = ''
         }
     }
 }
@@ -116,7 +122,12 @@ function Test-PagConfig {
 function Test-PagMailConfigured {
     param([Parameter(Mandatory)] $Config)
     $m = $Config.Mail
-    [bool]($m.TenantId -and $m.ClientId -and $m.SecretProtected -and $m.From -and $m.To)
+    if (-not ($m.From -and $m.To)) { return $false }
+    if ($m.Method -eq 'Smtp') {
+        # Authentification facultative, mais un utilisateur sans mot de passe est incomplet
+        return [bool]($m.SmtpServer -and $m.SmtpPort -and (-not $m.SmtpUser -or $m.SmtpPasswordProtected))
+    }
+    [bool]($m.TenantId -and $m.ClientId -and $m.SecretProtected)
 }
 
 #endregion
@@ -165,7 +176,7 @@ function Unprotect-PagSecret {
 
 #endregion
 
-#region Mail (Microsoft Graph, flux client credentials, permission application Mail.Send)
+#region Mail : Microsoft Graph (client credentials, permission application Mail.Send) ou SMTP
 
 function Send-PagMail {
     param(
@@ -173,6 +184,11 @@ function Send-PagMail {
         [Parameter(Mandatory)][string]$Subject,
         [Parameter(Mandatory)][string]$HtmlBody
     )
+    if ($Config.Mail.Method -eq 'Smtp') {
+        if (-not (Test-PagMailConfigured -Config $Config)) { throw 'Paramètres SMTP incomplets (serveur, port, expéditeur, destinataires, mot de passe si un utilisateur est saisi).' }
+        Send-PagSmtpMail -Mail $Config.Mail -Subject $Subject -HtmlBody $HtmlBody
+        return
+    }
     if (-not (Test-PagMailConfigured -Config $Config)) { throw 'Paramètres mail incomplets (tenant, client, secret, expéditeur, destinataires).' }
     $m = $Config.Mail
     $guid = '^[0-9a-fA-F]{8}(-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}$'
@@ -215,6 +231,39 @@ function Send-PagMail {
         ContentType = 'application/json; charset=utf-8'
         Body        = [Text.Encoding]::UTF8.GetBytes($payload)
     } | Out-Null
+}
+
+function Send-PagSmtpMail {
+    # Envoi SMTP classique (System.Net.Mail). EnableSsl = STARTTLS, port 587 ou 25 ;
+    # le SSL implicite du port 465 n'est pas pris en charge par SmtpClient.
+    param([Parameter(Mandatory)] $Mail, [Parameter(Mandatory)][string]$Subject, [Parameter(Mandatory)][string]$HtmlBody)
+    [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+    $client = New-Object Net.Mail.SmtpClient($Mail.SmtpServer, [int]$Mail.SmtpPort)
+    $message = New-Object Net.Mail.MailMessage
+    try {
+        $client.EnableSsl = [bool]$Mail.SmtpSsl
+        $client.Timeout = 30000
+        $client.UseDefaultCredentials = $false
+        if ($Mail.SmtpUser) {
+            $client.Credentials = New-Object Net.NetworkCredential($Mail.SmtpUser, (Unprotect-PagSecret -Protected $Mail.SmtpPasswordProtected))
+        }
+        $message.From = New-Object Net.Mail.MailAddress($Mail.From)
+        foreach ($to in @($Mail.To -split '[;,]' | ForEach-Object { $_.Trim() } | Where-Object { $_ })) { $message.To.Add($to) }
+        $message.Subject = $Subject
+        $message.SubjectEncoding = [Text.Encoding]::UTF8
+        $message.Body = $HtmlBody
+        $message.BodyEncoding = [Text.Encoding]::UTF8
+        $message.IsBodyHtml = $true
+        $message.Priority = 'High'
+        $client.Send($message)
+    }
+    catch {
+        throw "Envoi SMTP via $($Mail.SmtpServer):$($Mail.SmtpPort) : $($_.Exception.GetBaseException().Message)"
+    }
+    finally {
+        $message.Dispose()
+        $client.Dispose()
+    }
 }
 
 function ConvertTo-PagMailBanner {

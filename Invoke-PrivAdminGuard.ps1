@@ -15,7 +15,7 @@
     groupe imbriqué), désactivation, description horodatée, déplacement dans l'OU de quarantaine.
     Un groupe imbriqué présent dans whitelist.txt est autorisé, mais ses membres restent contrôlés un par un ;
     absent de la liste, il est signalé. Ordinateurs, gMSA et objets non résolus hors liste sont seulement signalés.
-    Un mail récapitulatif est envoyé via Microsoft Graph et chaque détection est inscrite dans le journal
+    Un mail récapitulatif est envoyé (Microsoft Graph ou SMTP, selon config.json) et chaque détection est inscrite dans le journal
     Application (source PrivAdminGuard, ID 1000 = quarantaine, 1001 = détection sans action, 1002 = erreur).
     En mode simulation (config.json) ou avec -WhatIf, rien n'est modifié dans l'AD ; le mail est tout de même envoyé.
     Refuse de s'exécuter si whitelist.txt n'existe pas, pour ne pas mettre en quarantaine les administrateurs en place.
