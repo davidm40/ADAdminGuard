@@ -1,4 +1,4 @@
-<p align="center"><img src="docs/images/logo.svg" width="140" alt="Logo ADAdminGuard : un bouclier qui protège un groupe de comptes, dont un est refusé"></p>
+<img src="docs/images/logo.svg" width="120" align="left" alt="Logo ADAdminGuard : un bouclier qui protège un groupe de comptes, dont un est refusé">
 
 # ADAdminGuard
 
