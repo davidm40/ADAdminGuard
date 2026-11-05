@@ -1,5 +1,7 @@
 <h1><img src="docs/images/logo.svg" width="64" align="absmiddle" alt="Logo ADAdminGuard : un bouclier qui protège un groupe de comptes, dont un est refusé"> ADAdminGuard</h1>
 
+[![Offrir un café sur Ko-fi](https://img.shields.io/badge/Ko--fi-offrir%20un%20caf%C3%A9-ff5e5b?logo=ko-fi&logoColor=white)](https://ko-fi.com/code4human)
+
 Garde-fou pour les groupes à privilèges d'Active Directory. Seuls les comptes d'une **liste blanche** (et le compte
 **Administrateur intégré**) peuvent être membres des groupes **Admins du domaine**, **Administrateurs de
 l'entreprise** et **Administrateurs du schéma**, directement ou par un groupe imbriqué. Tout autre compte qui y
