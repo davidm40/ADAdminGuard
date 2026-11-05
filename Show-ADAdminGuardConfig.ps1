@@ -2,7 +2,7 @@
 #Requires -Modules ActiveDirectory
 <#
 .SYNOPSIS
-    Configurateur graphique de PrivAdminGuard, en cinq étapes guidées.
+    Configurateur graphique de ADAdminGuard, en cinq étapes guidées.
 .DESCRIPTION
     Ouvre une fenêtre à cinq étapes numérotées, parcourues avec Précédent / Suivant ou directement par les onglets :
       1. Liste blanche  : groupes surveillés, comptes exclus (whitelist.txt), import des membres actuels ;
@@ -14,7 +14,7 @@
     Les secrets (secret client, mot de passe SMTP) sont chiffrés avec DPAPI pour cette machine : lancer le
     configurateur sur chaque contrôleur de domaine où la tâche doit tourner.
 .EXAMPLE
-    .\Show-PrivAdminGuardConfig.ps1
+    .\Show-ADAdminGuardConfig.ps1
 .NOTES
     Version : 1.1 (2026-11-05) - étapes guidées, envoi SMTP
 #>
@@ -26,11 +26,11 @@ $ErrorActionPreference = 'Stop'
 
 Add-Type -AssemblyName System.Windows.Forms, System.Drawing
 Import-Module ActiveDirectory -Verbose:$false
-Import-Module (Join-Path $PSScriptRoot 'PrivAdminGuard.psm1') -Force -Verbose:$false
+Import-Module (Join-Path $PSScriptRoot 'ADAdminGuard.psm1') -Force -Verbose:$false
 [Windows.Forms.Application]::EnableVisualStyles()
 
-$cfg       = Get-PagConfig
-$groupDefs = Get-PagGroupDefinition
+$cfg       = Get-AdagConfig
+$groupDefs = Get-AdagGroupDefinition
 $isAdmin   = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 $isDC      = (Get-CimInstance -ClassName Win32_ComputerSystem).DomainRole -ge 4
 $script:SimulationMode        = [bool]$cfg.SimulationMode
@@ -82,19 +82,19 @@ function Add-SecretBox {
 
 function Show-Message {
     param([string]$Text, [ValidateSet('Information', 'Warning', 'Error')][string]$Icon = 'Information')
-    [void][Windows.Forms.MessageBox]::Show($Text, 'PrivAdminGuard', 'OK', $Icon)
+    [void][Windows.Forms.MessageBox]::Show($Text, 'ADAdminGuard', 'OK', $Icon)
 }
 
 function Confirm-Action {
     param([string]$Text)
-    [Windows.Forms.MessageBox]::Show($Text, 'PrivAdminGuard', 'YesNo', 'Question') -eq 'Yes'
+    [Windows.Forms.MessageBox]::Show($Text, 'ADAdminGuard', 'YesNo', 'Question') -eq 'Yes'
 }
 
 function Select-InstallMode {
     # Fenêtre de choix du mode d'installation (une MessageBox ne permet pas de renommer Oui/Non).
     # Renvoie 'Simulation', 'Application' ou $null si annulé.
     $dlg = New-Object Windows.Forms.Form
-    $dlg.Text = 'PrivAdminGuard'
+    $dlg.Text = 'ADAdminGuard'
     $dlg.ClientSize = New-Object Drawing.Size(470, 245)
     $dlg.StartPosition = 'CenterParent'
     $dlg.FormBorderStyle = 'FixedDialog'
@@ -109,7 +109,7 @@ function Select-InstallMode {
         "Dans quel mode installer la tâche ?`r`n`r`n" +
         "Simulation : la tâche détecte et envoie le mail en détaillant ce qu'elle aurait fait, sans modifier l'AD.`r`n`r`n" +
         "Application : les comptes hors pattern ET hors liste blanche sont retirés des groupes, désactivés et déplacés.`r`n`r`n" +
-        "Les droits du dossier $(Get-PagRoot) seront restreints à SYSTEM et Administrateurs."))
+        "Les droits du dossier $(Get-AdagRoot) seront restreints à SYSTEM et Administrateurs."))
 
     $btnSim = Add-Control -Parent $dlg -Type Button -X 120 -Y 205 -Width 110 -Height 28 -Text 'Simulation'
     $btnSim.DialogResult = 'Yes'
@@ -137,7 +137,7 @@ function Get-SelectedGroupKey {
 function Get-SecretValue {
     # Secret à enregistrer : nouveau secret chiffré s'il a été saisi, sinon celui déjà enregistré
     param([Parameter(Mandatory)] $Box, [AllowEmptyString()][string]$Stored)
-    if ($Box.Text -and $Box.Text -ne $script:SecretMask) { return Protect-PagSecret -PlainText $Box.Text }
+    if ($Box.Text -and $Box.Text -ne $script:SecretMask) { return Protect-AdagSecret -PlainText $Box.Text }
     $Stored
 }
 
@@ -201,17 +201,17 @@ function Update-MailMethod {
 }
 
 function Update-TaskState {
-    $state = Get-PagTaskState
+    $state = Get-AdagTaskState
     $script:TaskInstalled = $state -ne 'non installée'
-    $lblDeploy.Text = "Dossier : $(Get-PagRoot)`r`n" +
+    $lblDeploy.Text = "Dossier : $(Get-AdagRoot)`r`n" +
         "Cette machine : $env:COMPUTERNAME ($(if ($isDC) { 'contrôleur de domaine' } else { 'PAS un contrôleur de domaine' }))" +
         "$(if (-not $isAdmin) { ', console non élevée' })`r`n" +
-        "Tâche planifiée « $(Get-PagTaskName) » : $state`r`n" +
-        "Mode enregistré dans config.json : $(if ((Get-PagConfig).SimulationMode) { 'SIMULATION (aucune modification de l''AD)' } else { 'APPLICATION' })"
+        "Tâche planifiée « $(Get-AdagTaskName) » : $state`r`n" +
+        "Mode enregistré dans config.json : $(if ((Get-AdagConfig).SimulationMode) { 'SIMULATION (aucune modification de l''AD)' } else { 'APPLICATION' })"
 }
 
 function Update-AuditState {
-    $script:AuditState = Get-PagAuditState
+    $script:AuditState = Get-AdagAuditState
     $head = "Audit « Gestion des groupes de sécurité » : $($script:AuditState.Text)"
     if ($script:AuditState.Enabled -eq $true) {
         $lblAudit.Text = "$head`r`nLes ajouts aux groupes génèrent bien les événements 4728/4756."
@@ -283,21 +283,21 @@ function Update-StepState {
 function Save-FormConfig {
     # Enregistre config.json et whitelist.txt ; renvoie $false si la configuration est refusée
     $c = Get-FormConfig
-    $problems = @(Test-PagConfig -Config $c)
+    $problems = @(Test-AdagConfig -Config $c)
     if ($problems.Count) {
         Show-Message -Text ("Configuration non enregistrée :`r`n- " + ($problems -join "`r`n- ")) -Icon Warning
         return $false
     }
     if ($c.QuarantineOU) {
-        try { [void](Get-ADObject -Identity $c.QuarantineOU -Server (Get-PagDomainFromDN -DistinguishedName $c.QuarantineOU)) }
+        try { [void](Get-ADObject -Identity $c.QuarantineOU -Server (Get-AdagDomainFromDN -DistinguishedName $c.QuarantineOU)) }
         catch {
             Show-Message -Text "OU de quarantaine introuvable dans l'AD :`r`n$($c.QuarantineOU)`r`n`r`nConfiguration non enregistrée." -Icon Warning
             return $false
         }
     }
 
-    Save-PagConfig -Config $c
-    Save-PagWhitelist -Name @($lstWhite.Items | ForEach-Object { [string]$_ })
+    Save-AdagConfig -Config $c
+    Save-AdagWhitelist -Name @($lstWhite.Items | ForEach-Object { [string]$_ })
     $script:SecretProtected = $c.Mail.SecretProtected
     $script:SmtpPasswordProtected = $c.Mail.SmtpPasswordProtected
     Update-SecretState
@@ -312,7 +312,7 @@ function Save-FormConfig {
 
 $script:UiReady = $false
 $form = New-Object Windows.Forms.Form
-$form.Text = 'PrivAdminGuard - Configuration'
+$form.Text = 'ADAdminGuard - Configuration'
 $form.ClientSize = New-Object Drawing.Size(740, 575)
 $form.StartPosition = 'CenterScreen'
 $form.FormBorderStyle = 'FixedDialog'
@@ -351,7 +351,7 @@ $btnImport = Add-Control -Parent $tabWhite -Type Button -X 500 -Y 66 -Width 200 
 $lstWhite = Add-Control -Parent $tabWhite -Type ListBox -X 10 -Y 162 -Width 570 -Height 200
 $lstWhite.Sorted = $true
 $lstWhite.SelectionMode = 'MultiExtended'
-foreach ($n in @(Get-PagWhitelist)) { [void]$lstWhite.Items.Add($n) }
+foreach ($n in @(Get-AdagWhitelist)) { [void]$lstWhite.Items.Add($n) }
 $btnWhiteRemove = Add-Control -Parent $tabWhite -Type Button -X 590 -Y 162 -Width 110 -Text 'Retirer'
 
 $txtWhite = Add-Control -Parent $tabWhite -Type TextBox -X 10 -Y 372 -Width 570
@@ -386,8 +386,8 @@ $btnImport.Add_Click({
         $form.Cursor = 'WaitCursor'
         $added = @()
         # Membres directs et imbriqués : les groupes imbriqués sont ajoutés aussi, pour autoriser l'imbrication
-        foreach ($gi in @(Get-PagGroup -Key $keys)) {
-            foreach ($e in @(Get-PagEffectiveMember -GroupInfo $gi)) {
+        foreach ($gi in @(Get-AdagGroup -Key $keys)) {
+            foreach ($e in @(Get-AdagEffectiveMember -GroupInfo $gi)) {
                 $n = $e.Member.SamAccountName
                 if ($n -and @($lstWhite.Items) -notcontains $n) {
                     [void]$lstWhite.Items.Add($n)
@@ -454,7 +454,7 @@ $lblScope.ForeColor = 'DimGray'
 # Modèles du module + « Aucun message » ; « Personnalisé » désigne un texte qui ne correspond à aucun modèle.
 # Le modèle affiché n'est pas enregistré : il est retrouvé en comparant le message de config.json aux modèles.
 $templates = [ordered]@{}
-foreach ($k in (Get-PagMailTemplate).Keys) { $templates[$k] = (Get-PagMailTemplate)[$k] }
+foreach ($k in (Get-AdagMailTemplate).Keys) { $templates[$k] = (Get-AdagMailTemplate)[$k] }
 $templates['Aucun message'] = ''
 $customLabel = 'Personnalisé'
 $script:TemplateSync = $false   # vrai pendant une mise à jour faite par le code (évite les événements en cascade)
@@ -583,7 +583,7 @@ $btnTestMail.Add_Click({
         $form.Cursor = 'WaitCursor'
         $c = Get-FormConfig
         # Le message de sensibilisation est inclus : le test sert aussi d'aperçu
-        Send-PagMail -Config $c -Subject '[PrivAdminGuard] Mail de test' -HtmlBody ((ConvertTo-PagMailBanner -Message $c.MailMessage) +
+        Send-AdagMail -Config $c -Subject '[ADAdminGuard] Mail de test' -HtmlBody ((ConvertTo-AdagMailBanner -Message $c.MailMessage) +
             ("<p>Mail de test envoyé depuis <b>$env:COMPUTERNAME</b> le {0:dd/MM/yyyy à HH:mm}.</p>" -f (Get-Date)))
         Show-Message -Text "Mail envoyé à $($c.Mail.To)."
     }
@@ -637,7 +637,7 @@ $btnInstall.Add_Click({
     $script:SimulationMode = $mode -eq 'Simulation'
     if (-not (Save-FormConfig)) { $script:SimulationMode = $previous; return }
     try {
-        Register-PagTask -Confirm:$false
+        Register-AdagTask -Confirm:$false
         Update-TaskState
         Update-StepState
         Show-Message -Text ("Tâche planifiée installée en mode $($mode.ToLower()).`r`n" +
@@ -650,13 +650,13 @@ $btnUninstall.Add_Click({
     if (-not $isAdmin) { Show-Message -Text 'Relancez le configurateur en tant qu''administrateur.' -Icon Warning; return }
     if (-not $script:TaskInstalled) { Show-Message -Text 'La tâche n''est pas installée.'; return }
     if (-not (Confirm-Action -Text 'Supprimer la tâche planifiée ? Le contrôle ne sera plus effectué sur ce serveur.')) { return }
-    try { Unregister-PagTask -Confirm:$false; Update-TaskState; Update-StepState }
+    try { Unregister-AdagTask -Confirm:$false; Update-TaskState; Update-StepState }
     catch { Show-Message -Text "Suppression impossible : $($_.Exception.Message)" -Icon Error }
 })
 
 $btnRunTest.Add_Click({
     if (-not (Save-FormConfig)) { return }
-    $main = Join-Path (Get-PagRoot) 'Invoke-PrivAdminGuard.ps1'
+    $main = Join-Path (Get-AdagRoot) 'Invoke-ADAdminGuard.ps1'
     $arguments = "-NoExit -NoProfile -ExecutionPolicy Bypass -File `"$main`" -WhatIf"
     # Lecture du journal Sécurité : nécessite une console élevée
     if ($isAdmin) { Start-Process -FilePath 'powershell.exe' -ArgumentList $arguments }
@@ -667,7 +667,7 @@ $btnRunTask.Add_Click({
     if (-not $isAdmin) { Show-Message -Text 'Relancez le configurateur en tant qu''administrateur.' -Icon Warning; return }
     if (-not $script:TaskInstalled) { Show-Message -Text 'Installez d''abord la tâche planifiée.' -Icon Warning; return }
     try {
-        Start-ScheduledTask -TaskName (Get-PagTaskName)
+        Start-ScheduledTask -TaskName (Get-AdagTaskName)
         Update-TaskState
         Show-Message -Text ("Tâche lancée en SYSTEM, dans le mode enregistré dans config.json.`r`n" +
             "Le résultat est dans le journal du jour (bouton « Ouvrir le dossier des journaux ») et, s'il y a un compte hors pattern et hors liste blanche, dans le mail.")
@@ -678,7 +678,7 @@ $btnRunTask.Add_Click({
 $btnAudit.Add_Click({ Update-AuditState })
 
 $btnLogs.Add_Click({
-    $logs = Join-Path (Get-PagRoot) 'logs'
+    $logs = Join-Path (Get-AdagRoot) 'logs'
     New-Item -ItemType Directory -Path $logs -Force | Out-Null
     Start-Process -FilePath 'explorer.exe' -ArgumentList "`"$logs`""
 })

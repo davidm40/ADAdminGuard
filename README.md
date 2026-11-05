@@ -1,15 +1,15 @@
-# PrivAdminGuard
+# ADAdminGuard
 
 Garde-fou pour les groupes à privilèges d'Active Directory. Dès qu'un compte est ajouté aux groupes
 **Admins du domaine**, **Administrateurs de l'entreprise** ou **Administrateurs du schéma**, directement ou par un
-groupe imbriqué, PrivAdminGuard vérifie qu'il respecte la convention de nommage des comptes d'administration
+groupe imbriqué, ADAdminGuard vérifie qu'il respecte la convention de nommage des comptes d'administration
 ou qu'il figure dans une liste blanche. Sinon, il le met en quarantaine et prévient par mail.
 
 Le contrôle tourne sur chaque contrôleur de domaine, en tâche planifiée SYSTEM, déclenchée par les événements
 de sécurité 4728 / 4756 et rejouée toutes les heures. Un configurateur graphique (WinForms) guide la mise en place
 en cinq étapes. Les alertes partent par Microsoft 365 (Graph) ou par un serveur SMTP classique.
 
-> **Ce que PrivAdminGuard est, et n'est pas.** C'est un contrôle de conformité et un détecteur rapide : il fait
+> **Ce que ADAdminGuard est, et n'est pas.** C'est un contrôle de conformité et un détecteur rapide : il fait
 > respecter la convention de nommage et signale tout ajout non prévu. Ce n'est pas une barrière contre un
 > attaquant déjà administrateur du domaine, qui peut désactiver la tâche ou nommer son compte selon le pattern.
 > Il complète le modèle d'administration en tiers, la délégation restreinte et une supervision (SIEM, Defender
@@ -39,7 +39,7 @@ en cinq étapes. Les alertes partent par Microsoft 365 (Graph) ou par un serveur
 
 ### Déclenchement
 
-La tâche planifiée `PrivAdminGuard` s'exécute en **SYSTEM** sur chaque contrôleur de domaine :
+La tâche planifiée `ADAdminGuard` s'exécute en **SYSTEM** sur chaque contrôleur de domaine :
 
 | Déclencheur | Rôle |
 |---|---|
@@ -76,7 +76,7 @@ Pour un compte utilisateur hors pattern **et** hors liste blanche :
 1. **Retrait du groupe qui le contient directement** : le groupe surveillé, ou le groupe imbriqué par lequel il
    obtient ses droits (le retirer du seul groupe surveillé ne servirait à rien) ;
 2. **Désactivation** du compte ;
-3. **Description horodatée** : `[PrivAdminGuard AAAA-MM-JJ HH:mm] Quarantaine : …`, l'ancienne description
+3. **Description horodatée** : `[ADAdminGuard AAAA-MM-JJ HH:mm] Quarantaine : …`, l'ancienne description
    est conservée à la suite ;
 4. **Déplacement** dans l'OU de quarantaine.
 
@@ -142,16 +142,16 @@ Sans cet audit, la tâche ne réagit qu'au contrôle horaire et l'auteur de l'aj
 
 ## Installation
 
-1. Copier le dossier sur **chaque contrôleur de domaine**, par exemple dans `C:\Scripts\PrivAdminGuard`.
-2. Lancer **`Configurer-PrivAdminGuard.bat`** : il demande l'élévation si nécessaire, puis ouvre le configurateur.
+1. Copier le dossier sur **chaque contrôleur de domaine**, par exemple dans `C:\Scripts\ADAdminGuard`.
+2. Lancer **`Configurer-ADAdminGuard.bat`** : il demande l'élévation si nécessaire, puis ouvre le configurateur.
 3. Suivre les étapes 1 à 4 du configurateur (voir [Configuration](#configuration)), puis cliquer sur **Enregistrer**.
 4. Étape **5. Planification** > **Installer / mettre à jour la tâche planifiée**, puis choisir **Simulation** ou
    **Application**.
 
 L'installation :
 
-- crée ou met à jour la tâche planifiée `PrivAdminGuard` ;
-- crée la source d'événements `PrivAdminGuard` dans le journal Application ;
+- crée ou met à jour la tâche planifiée `ADAdminGuard` ;
+- crée la source d'événements `ADAdminGuard` dans le journal Application ;
 - **restreint les droits du dossier à SYSTEM et Administrateurs** (voir [Sécurité](#sécurité)).
 
 La configuration est **propre à chaque DC** : le secret client et le mot de passe SMTP sont chiffrés pour la
@@ -162,7 +162,7 @@ copie de `config.json`.
 
 ## Configuration
 
-Le configurateur `Show-PrivAdminGuardConfig.ps1` (lancé par le `.bat`) guide la mise en place en **cinq étapes
+Le configurateur `Show-ADAdminGuardConfig.ps1` (lancé par le `.bat`) guide la mise en place en **cinq étapes
 numérotées**, parcourues avec **Précédent / Suivant** ou directement par les onglets. Une coche ✓ marque chaque
 étape terminée et un compteur indique la progression. L'installation de la tâche reste **bloquée tant que les
 étapes 1 et 2 ne sont pas faites**. **Enregistrer** écrit `config.json` et `whitelist.txt` à tout moment.
@@ -281,9 +281,9 @@ installée.
 
 ```powershell
 Connect-ExchangeOnline
-New-ServicePrincipal -AppId <ID d'application> -ObjectId <ID d'objet de l'application d'entreprise> -DisplayName 'PrivAdminGuard'
-New-ManagementScope -Name 'PrivAdminGuard-Expediteur' -RecipientRestrictionFilter "PrimarySmtpAddress -eq 'alertes-ad@contoso.com'"
-New-ManagementRoleAssignment -App <ID d'application> -Role 'Application Mail.Send' -CustomResourceScope 'PrivAdminGuard-Expediteur'
+New-ServicePrincipal -AppId <ID d'application> -ObjectId <ID d'objet de l'application d'entreprise> -DisplayName 'ADAdminGuard'
+New-ManagementScope -Name 'ADAdminGuard-Expediteur' -RecipientRestrictionFilter "PrimarySmtpAddress -eq 'alertes-ad@contoso.com'"
+New-ManagementRoleAssignment -App <ID d'application> -Role 'Application Mail.Send' -CustomResourceScope 'ADAdminGuard-Expediteur'
 ```
 
 Retirer ensuite la permission `Mail.Send` accordée à l'étape 2 dans Entra ID : c'est l'attribution Exchange qui
@@ -327,8 +327,8 @@ Microsoft : avec un locataire Microsoft 365, préférer la méthode Graph.
 
 | Emplacement | Contenu |
 |---|---|
-| `logs\PrivAdminGuard_AAAAMMJJ.log` | Un fichier par jour, purgé après 90 jours : configuration lue, état de l'audit, nombre d'événements lus, comptes non conformes, actions, envoi du mail, erreurs. |
-| Journal **Application**, source `PrivAdminGuard` | Pour la supervision (SIEM) : |
+| `logs\ADAdminGuard_AAAAMMJJ.log` | Un fichier par jour, purgé après 90 jours : configuration lue, état de l'audit, nombre d'événements lus, comptes non conformes, actions, envoi du mail, erreurs. |
+| Journal **Application**, source `ADAdminGuard` | Pour la supervision (SIEM) : |
 | — ID **1000** (Avertissement) | Compte mis en quarantaine |
 | — ID **1001** (Avertissement) | Compte non conforme détecté sans action (simulation, `-WhatIf`, objet autre qu'un utilisateur) |
 | — ID **1002** (Erreur) | Erreur du contrôle ou échec de l'envoi du mail |
@@ -342,10 +342,10 @@ dans le journal Application.
 
 ```powershell
 # Contrôle sans rien modifier : affiche les actions prévues et envoie le mail
-.\Invoke-PrivAdminGuard.ps1 -WhatIf
+.\Invoke-ADAdminGuard.ps1 -WhatIf
 
 # Fenêtre de recherche des événements 4728/4756 (minutes, 120 par défaut) et dossier de journaux
-.\Invoke-PrivAdminGuard.ps1 -EventLookbackMinutes 240 -LogDir D:\Logs\PrivAdminGuard
+.\Invoke-ADAdminGuard.ps1 -EventLookbackMinutes 240 -LogDir D:\Logs\ADAdminGuard
 ```
 
 À lancer dans une console **élevée** : la lecture du journal Sécurité l'exige.
@@ -395,7 +395,7 @@ dans le journal Application.
 | `Envoi SMTP via … : refusée` / délai dépassé | Serveur ou port injoignable depuis le DC (pare-feu), ou mauvais port. |
 | `5.7.1` / relais refusé | Relais anonyme non autorisé pour l'adresse IP du DC, ou authentification requise. |
 | `Secret illisible sur <DC>` | `config.json` copié depuis une autre machine : ressaisir le secret client ou le mot de passe SMTP sur ce DC. |
-| Audit « non vérifiable » | Configurateur lancé sans élévation : passer par `Configurer-PrivAdminGuard.bat`. |
+| Audit « non vérifiable » | Configurateur lancé sans élévation : passer par `Configurer-ADAdminGuard.bat`. |
 
 ---
 
@@ -403,10 +403,10 @@ dans le journal Application.
 
 | Fichier | Rôle |
 |---|---|
-| `Configurer-PrivAdminGuard.bat` | Lanceur du configurateur, avec élévation automatique. |
-| `Show-PrivAdminGuardConfig.ps1` | Configurateur graphique en cinq étapes. |
-| `Invoke-PrivAdminGuard.ps1` | Contrôle, exécuté par la tâche planifiée. |
-| `PrivAdminGuard.psm1` | Fonctions communes : configuration, liste blanche, secrets, envoi Graph et SMTP, AD, tâche planifiée. |
+| `Configurer-ADAdminGuard.bat` | Lanceur du configurateur, avec élévation automatique. |
+| `Show-ADAdminGuardConfig.ps1` | Configurateur graphique en cinq étapes. |
+| `Invoke-ADAdminGuard.ps1` | Contrôle, exécuté par la tâche planifiée. |
+| `ADAdminGuard.psm1` | Fonctions communes : configuration, liste blanche, secrets, envoi Graph et SMTP, AD, tâche planifiée. |
 | `config.json` | Configuration, créée par le configurateur (non versionnée). |
 | `whitelist.txt` | Liste blanche, créée par le configurateur (non versionnée). |
 | `logs\` | Journaux quotidiens (non versionnés). |

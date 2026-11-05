@@ -1,6 +1,6 @@
 ﻿#Requires -Version 5.1
 <#
-    Fonctions communes à Invoke-PrivAdminGuard.ps1 (contrôle) et Show-PrivAdminGuardConfig.ps1 (configurateur).
+    Fonctions communes à Invoke-ADAdminGuard.ps1 (contrôle) et Show-ADAdminGuardConfig.ps1 (configurateur).
     Fichiers gérés, tous à la racine du dossier du script :
       config.json   : paramètres (pattern, groupes, OU de quarantaine, mail, secret chiffré DPAPI machine)
       whitelist.txt : comptes exclus du contrôle, un sAMAccountName par ligne
@@ -13,10 +13,10 @@ Add-Type -AssemblyName System.Security
 $script:Root          = $PSScriptRoot
 $script:ConfigPath    = Join-Path $PSScriptRoot 'config.json'
 $script:WhitelistPath = Join-Path $PSScriptRoot 'whitelist.txt'
-$script:TaskName      = 'PrivAdminGuard'
-$script:EventSource   = 'PrivAdminGuard'
+$script:TaskName      = 'ADAdminGuard'
+$script:EventSource   = 'ADAdminGuard'
 # Entropie ajoutée au chiffrement DPAPI : le secret ne se déchiffre pas par un simple appel sans elle
-$script:Entropy       = [Text.Encoding]::UTF8.GetBytes('PrivAdminGuard/DPAPI')
+$script:Entropy       = [Text.Encoding]::UTF8.GetBytes('ADAdminGuard/DPAPI')
 
 # Groupes surveillés, désignés par RID : indépendant de la langue de l'AD (« Admins du domaine »…)
 $script:GroupDefinitions = [ordered]@{
@@ -44,16 +44,16 @@ $script:MailTemplates = [ordered]@{
         "et ont été désactivés. Prenez les mesures nécessaires.")
 }
 
-function Get-PagMailTemplate { $script:MailTemplates }
-function Get-PagGroupDefinition { $script:GroupDefinitions }
-function Get-PagRoot { $script:Root }
-function Get-PagWhitelistPath { $script:WhitelistPath }
-function Get-PagTaskName { $script:TaskName }
-function Get-PagEventSource { $script:EventSource }
+function Get-AdagMailTemplate { $script:MailTemplates }
+function Get-AdagGroupDefinition { $script:GroupDefinitions }
+function Get-AdagRoot { $script:Root }
+function Get-AdagWhitelistPath { $script:WhitelistPath }
+function Get-AdagTaskName { $script:TaskName }
+function Get-AdagEventSource { $script:EventSource }
 
 #region Configuration
 
-function New-PagDefaultConfig {
+function New-AdagDefaultConfig {
     [pscustomobject]@{
         Pattern        = '^adm-'
         Groups         = @('DomainAdmins', 'EnterpriseAdmins', 'SchemaAdmins')
@@ -76,8 +76,8 @@ function New-PagDefaultConfig {
     }
 }
 
-function Get-PagConfig {
-    $default = New-PagDefaultConfig
+function Get-AdagConfig {
+    $default = New-AdagDefaultConfig
     if (-not (Test-Path -LiteralPath $script:ConfigPath)) { return $default }
 
     $cfg = Get-Content -LiteralPath $script:ConfigPath -Raw -Encoding UTF8 | ConvertFrom-Json
@@ -92,7 +92,7 @@ function Get-PagConfig {
     $cfg
 }
 
-function Save-PagConfig {
+function Save-AdagConfig {
     [CmdletBinding(SupportsShouldProcess)]
     param([Parameter(Mandatory)] $Config)
     if ($PSCmdlet.ShouldProcess($script:ConfigPath, 'Enregistrer la configuration')) {
@@ -100,7 +100,7 @@ function Save-PagConfig {
     }
 }
 
-function Test-PagConfig {
+function Test-AdagConfig {
     # Renvoie la liste des problèmes bloquants (vide si la configuration est utilisable)
     param([Parameter(Mandatory)] $Config)
     $problems = @()
@@ -119,7 +119,7 @@ function Test-PagConfig {
     $problems
 }
 
-function Test-PagMailConfigured {
+function Test-AdagMailConfigured {
     param([Parameter(Mandatory)] $Config)
     $m = $Config.Mail
     if (-not ($m.From -and $m.To)) { return $false }
@@ -134,18 +134,18 @@ function Test-PagMailConfigured {
 
 #region Liste blanche
 
-function Get-PagWhitelist {
+function Get-AdagWhitelist {
     if (-not (Test-Path -LiteralPath $script:WhitelistPath)) { return @() }
     @(Get-Content -LiteralPath $script:WhitelistPath -Encoding UTF8 |
         ForEach-Object { ($_ -replace '#.*$', '').Trim() } |
         Where-Object { $_ })
 }
 
-function Save-PagWhitelist {
+function Save-AdagWhitelist {
     [CmdletBinding(SupportsShouldProcess)]
     param([AllowEmptyCollection()][string[]]$Name = @())
     $header = @(
-        '# Comptes exclus du contrôle PrivAdminGuard : un sAMAccountName par ligne, # = commentaire.'
+        '# Comptes exclus du contrôle ADAdminGuard : un sAMAccountName par ligne, # = commentaire.'
         "# Mis à jour le $(Get-Date -Format 'yyyy-MM-dd HH:mm') par $env:USERDOMAIN\$env:USERNAME"
     )
     if ($PSCmdlet.ShouldProcess($script:WhitelistPath, 'Enregistrer la liste blanche')) {
@@ -157,13 +157,13 @@ function Save-PagWhitelist {
 
 #region Secret (DPAPI portée machine : lisible par SYSTEM sur cette machine uniquement)
 
-function Protect-PagSecret {
+function Protect-AdagSecret {
     param([Parameter(Mandatory)][string]$PlainText)
     $bytes = [Text.Encoding]::UTF8.GetBytes($PlainText)
     [Convert]::ToBase64String([Security.Cryptography.ProtectedData]::Protect($bytes, $script:Entropy, 'LocalMachine'))
 }
 
-function Unprotect-PagSecret {
+function Unprotect-AdagSecret {
     param([Parameter(Mandatory)][string]$Protected)
     try {
         $bytes = [Security.Cryptography.ProtectedData]::Unprotect([Convert]::FromBase64String($Protected), $script:Entropy, 'LocalMachine')
@@ -178,18 +178,18 @@ function Unprotect-PagSecret {
 
 #region Mail : Microsoft Graph (client credentials, permission application Mail.Send) ou SMTP
 
-function Send-PagMail {
+function Send-AdagMail {
     param(
         [Parameter(Mandatory)] $Config,
         [Parameter(Mandatory)][string]$Subject,
         [Parameter(Mandatory)][string]$HtmlBody
     )
     if ($Config.Mail.Method -eq 'Smtp') {
-        if (-not (Test-PagMailConfigured -Config $Config)) { throw 'Paramètres SMTP incomplets (serveur, port, expéditeur, destinataires, mot de passe si un utilisateur est saisi).' }
-        Send-PagSmtpMail -Mail $Config.Mail -Subject $Subject -HtmlBody $HtmlBody
+        if (-not (Test-AdagMailConfigured -Config $Config)) { throw 'Paramètres SMTP incomplets (serveur, port, expéditeur, destinataires, mot de passe si un utilisateur est saisi).' }
+        Send-AdagSmtpMail -Mail $Config.Mail -Subject $Subject -HtmlBody $HtmlBody
         return
     }
-    if (-not (Test-PagMailConfigured -Config $Config)) { throw 'Paramètres mail incomplets (tenant, client, secret, expéditeur, destinataires).' }
+    if (-not (Test-AdagMailConfigured -Config $Config)) { throw 'Paramètres mail incomplets (tenant, client, secret, expéditeur, destinataires).' }
     $m = $Config.Mail
     $guid = '^[0-9a-fA-F]{8}(-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}$'
     if ($m.ClientId -notmatch $guid) {
@@ -201,12 +201,12 @@ function Send-PagMail {
     }
     [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
 
-    $token = Invoke-PagRestMethod -Step "Obtention du jeton auprès d'Entra ID" -Parameters @{
+    $token = Invoke-AdagRestMethod -Step "Obtention du jeton auprès d'Entra ID" -Parameters @{
         Method = 'Post'
         Uri    = "https://login.microsoftonline.com/$($m.TenantId)/oauth2/v2.0/token"
         Body   = @{
             client_id     = $m.ClientId
-            client_secret = Unprotect-PagSecret -Protected $m.SecretProtected
+            client_secret = Unprotect-AdagSecret -Protected $m.SecretProtected
             scope         = 'https://graph.microsoft.com/.default'
             grant_type    = 'client_credentials'
         }
@@ -224,7 +224,7 @@ function Send-PagMail {
         saveToSentItems = $false
     } | ConvertTo-Json -Depth 6
 
-    Invoke-PagRestMethod -Step "Envoi du mail depuis $($m.From)" -Parameters @{
+    Invoke-AdagRestMethod -Step "Envoi du mail depuis $($m.From)" -Parameters @{
         Method      = 'Post'
         Uri         = "https://graph.microsoft.com/v1.0/users/$($m.From)/sendMail"
         Headers     = @{ Authorization = "Bearer $($token.access_token)" }
@@ -233,7 +233,7 @@ function Send-PagMail {
     } | Out-Null
 }
 
-function Send-PagSmtpMail {
+function Send-AdagSmtpMail {
     # Envoi SMTP classique (System.Net.Mail). EnableSsl = STARTTLS, port 587 ou 25 ;
     # le SSL implicite du port 465 n'est pas pris en charge par SmtpClient.
     param([Parameter(Mandatory)] $Mail, [Parameter(Mandatory)][string]$Subject, [Parameter(Mandatory)][string]$HtmlBody)
@@ -245,7 +245,7 @@ function Send-PagSmtpMail {
         $client.Timeout = 30000
         $client.UseDefaultCredentials = $false
         if ($Mail.SmtpUser) {
-            $client.Credentials = New-Object Net.NetworkCredential($Mail.SmtpUser, (Unprotect-PagSecret -Protected $Mail.SmtpPasswordProtected))
+            $client.Credentials = New-Object Net.NetworkCredential($Mail.SmtpUser, (Unprotect-AdagSecret -Protected $Mail.SmtpPasswordProtected))
         }
         $message.From = New-Object Net.Mail.MailAddress($Mail.From)
         foreach ($to in @($Mail.To -split '[;,]' | ForEach-Object { $_.Trim() } | Where-Object { $_ })) { $message.To.Add($to) }
@@ -266,7 +266,7 @@ function Send-PagSmtpMail {
     }
 }
 
-function ConvertTo-PagMailBanner {
+function ConvertTo-AdagMailBanner {
     # Message de sensibilisation (config.json) encadré en tête du mail ; chaîne vide si aucun message
     param([AllowEmptyString()][string]$Message)
     $text = ($Message -replace "`r", '').Trim()
@@ -275,7 +275,7 @@ function ConvertTo-PagMailBanner {
         ([Net.WebUtility]::HtmlEncode($text) -replace "`n", '<br>')
 }
 
-function Invoke-PagRestMethod {
+function Invoke-AdagRestMethod {
     # Invoke-RestMethod qui remonte le motif renvoyé par Entra ID (AADSTSxxxx) ou Graph au lieu du seul code HTTP
     param([Parameter(Mandatory)][string]$Step, [Parameter(Mandatory)][hashtable]$Parameters)
     try { Invoke-RestMethod @Parameters }
@@ -296,13 +296,13 @@ function Invoke-PagRestMethod {
 
 #region Active Directory
 
-function Get-PagDomainFromDN {
+function Get-AdagDomainFromDN {
     # CN=x,OU=y,DC=contoso,DC=local -> contoso.local (domaine à interroger pour cet objet)
     param([Parameter(Mandatory)][string]$DistinguishedName)
     (@($DistinguishedName -split '(?<!\\),' | Where-Object { $_ -like 'DC=*' } | ForEach-Object { $_.Substring(3) })) -join '.'
 }
 
-function Test-PagInContainer {
+function Test-AdagInContainer {
     param([Parameter(Mandatory)][string]$DistinguishedName, [AllowEmptyCollection()][string[]]$Container = @())
     foreach ($c in $Container) {
         if ($c -and $DistinguishedName.EndsWith(",$c", [StringComparison]::OrdinalIgnoreCase)) { return $true }
@@ -310,7 +310,7 @@ function Test-PagInContainer {
     $false
 }
 
-function Get-PagGroup {
+function Get-AdagGroup {
     # Renvoie les groupes surveillés : clé, libellé, objet ADGroup (avec member) et serveur à interroger
     param([Parameter(Mandatory)][string[]]$Key)
     $domain = Get-ADDomain
@@ -330,11 +330,11 @@ function Get-PagGroup {
     }
 }
 
-function ConvertTo-PagMember {
+function ConvertTo-AdagMember {
     # Lit un objet AD par son DN et le normalise (objet non résolu : ObjectClass « inconnu »)
     param([Parameter(Mandatory)][string]$DistinguishedName)
     try {
-        $o = Get-ADObject -Identity $DistinguishedName -Server (Get-PagDomainFromDN -DistinguishedName $DistinguishedName) `
+        $o = Get-ADObject -Identity $DistinguishedName -Server (Get-AdagDomainFromDN -DistinguishedName $DistinguishedName) `
             -Properties sAMAccountName, objectSid, description, member
         $get = { param($n) $p = $o.PSObject.Properties[$n]; if ($p) { $p.Value } }
         $sid = & $get 'objectSid'
@@ -352,7 +352,7 @@ function ConvertTo-PagMember {
     }
 }
 
-function Get-PagEffectiveMember {
+function Get-AdagEffectiveMember {
     # Membres directs et imbriqués d'un groupe surveillé. Chaque objet est renvoyé avec le groupe qui le contient
     # directement (Parent*, celui dont il faut le retirer) et son chemin d'appartenance depuis le groupe surveillé.
     # Un groupe déjà parcouru n'est pas relu : les imbrications circulaires ne bouclent pas.
@@ -369,7 +369,7 @@ function Get-PagEffectiveMember {
     while ($pending.Count) {
         $parent = $pending.Dequeue()
         foreach ($dn in $parent.Members) {
-            $m = ConvertTo-PagMember -DistinguishedName $dn
+            $m = ConvertTo-AdagMember -DistinguishedName $dn
             [pscustomobject]@{
                 Member       = $m
                 ParentDN     = $parent.DN
@@ -382,14 +382,14 @@ function Get-PagEffectiveMember {
                 $name = if ($m.SamAccountName) { $m.SamAccountName } else { $m.DistinguishedName }
                 $pending.Enqueue([pscustomobject]@{
                     DN = $m.DistinguishedName; Name = $name; Path = "$($parent.Path) > $name"; Members = $m.Members
-                    Server = Get-PagDomainFromDN -DistinguishedName $m.DistinguishedName
+                    Server = Get-AdagDomainFromDN -DistinguishedName $m.DistinguishedName
                 })
             }
         }
     }
 }
 
-function Get-PagAddEvent {
+function Get-AdagAddEvent {
     # Ajouts à un groupe de sécurité global (4728) ou universel (4756) dans le journal Sécurité de ce serveur,
     # ou d'un autre DC avec -ComputerName. Lève une erreur si le journal est illisible (droits, RPC) :
     # « aucun événement » et « journal inaccessible » ne doivent pas se confondre.
@@ -421,7 +421,7 @@ function Get-PagAddEvent {
     }
 }
 
-function Get-PagMembershipOrigin {
+function Get-AdagMembershipOrigin {
     # Date et DC d'origine de l'ajout d'un membre à un groupe, lus dans les métadonnées de réplication de la valeur
     # liée « member ». Disponible depuis n'importe quel DC, contrairement à l'événement 4728/4756.
     param([Parameter(Mandatory)][string]$GroupDN, [Parameter(Mandatory)][string]$MemberDN, [Parameter(Mandatory)][string]$Server)
@@ -437,13 +437,13 @@ function Get-PagMembershipOrigin {
     [pscustomobject]@{ Time = $md.LastOriginatingChangeTime; DC = $origin }
 }
 
-function Get-PagAuditState {
+function Get-AdagAuditState {
     # Stratégie d'audit effective de la sous-catégorie « Gestion des groupes de sécurité » (source des 4728/4756).
     # Lue par auditpol /backup : la colonne Setting Value (0 aucun, 1 succès, 2 échec, 3 les deux) n'est pas traduite,
     # contrairement à /get. Nécessite une console élevée. Enabled = $null si la lecture est impossible.
     $guid = '{0CCE9237-69AE-11D9-BED3-505054503030}'
     # Chemins et fichier manipulés en .NET : le fournisseur PowerShell gère mal les noms courts 8.3 de %TEMP%
-    $file = [IO.Path]::Combine([IO.Path]::GetTempPath(), ('PrivAdminGuard_audit_{0}.csv' -f [guid]::NewGuid()))
+    $file = [IO.Path]::Combine([IO.Path]::GetTempPath(), ('ADAdminGuard_audit_{0}.csv' -f [guid]::NewGuid()))
     try {
         # En PS 5.1, avec ErrorActionPreference = Stop, la moindre sortie d'erreur d'un exécutable lève une exception
         $ErrorActionPreference = 'Continue'
@@ -469,17 +469,17 @@ function Get-PagAuditState {
 
 #region Tâche planifiée
 
-function Get-PagTaskState {
+function Get-AdagTaskState {
     $t = Get-ScheduledTask -TaskName $script:TaskName -ErrorAction SilentlyContinue
     if ($t) { [string]$t.State } else { 'non installée' }
 }
 
-function Register-PagTask {
+function Register-AdagTask {
     # Tâche SYSTEM déclenchée par les événements 4728/4756 + contrôle de rattrapage toutes les heures.
     # Restreint aussi les droits du dossier (SYSTEM et Administrateurs) : le script tourne en SYSTEM sur un DC.
     [CmdletBinding(SupportsShouldProcess)]
     param()
-    $scriptPath = Join-Path $script:Root 'Invoke-PrivAdminGuard.ps1'
+    $scriptPath = Join-Path $script:Root 'Invoke-ADAdminGuard.ps1'
 
     $eventTrigger = New-CimInstance -CimClass (Get-CimClass -ClassName MSFT_TaskEventTrigger -Namespace 'Root/Microsoft/Windows/TaskScheduler') -ClientOnly
     $eventTrigger.Subscription = '<QueryList><Query Id="0" Path="Security"><Select Path="Security">*[System[(EventID=4728 or EventID=4756)]]</Select></Query></QueryList>'
@@ -511,7 +511,7 @@ function Register-PagTask {
     }
 }
 
-function Unregister-PagTask {
+function Unregister-AdagTask {
     [CmdletBinding(SupportsShouldProcess)]
     param()
     if ($PSCmdlet.ShouldProcess($script:TaskName, 'Supprimer la tâche planifiée')) {
@@ -521,4 +521,4 @@ function Unregister-PagTask {
 
 #endregion
 
-Export-ModuleMember -Function *-Pag*
+Export-ModuleMember -Function *-Adag*
