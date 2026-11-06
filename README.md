@@ -3,12 +3,14 @@
 [![Offrir un café sur Ko-fi](https://img.shields.io/badge/Ko--fi-offrir%20un%20caf%C3%A9-ff5e5b?logo=ko-fi&logoColor=white)](https://ko-fi.com/code4human)
 
 Garde-fou pour les groupes à privilèges d'Active Directory. Seuls les comptes d'une **liste blanche** (et le compte
-**Administrateur intégré**) peuvent être membres des groupes **Admins du domaine**, **Administrateurs de
-l'entreprise** et **Administrateurs du schéma**, directement ou par un groupe imbriqué. Tout autre compte qui y
-entre est mis en quarantaine, et une alerte part par mail.
+**Administrateur intégré**) peuvent être membres des groupes surveillés, directement ou par un groupe imbriqué :
+**Admins du domaine**, **de l'entreprise**, **du schéma**, **Administrateurs** intégrés, **Opérateurs** de compte,
+de serveur, d'impression et de sauvegarde, **Duplicateurs**, **Administrateurs clés** (et Entreprise) et
+**DnsAdmins**. Chaque compte n'est admis que dans les groupes que la liste blanche lui accorde. Tout autre compte
+qui y entre est mis en quarantaine, et une alerte part par mail.
 
 Le contrôle tourne sur chaque contrôleur de domaine, en tâche planifiée SYSTEM, déclenchée par les événements
-de sécurité 4728 / 4756 et rejouée toutes les heures. Un configurateur graphique (WinForms) guide la mise en place
+de sécurité 4728 / 4732 / 4756 et rejouée toutes les heures. Un configurateur graphique (WinForms) guide la mise en place
 en quatre étapes. Les mails partent par Microsoft 365 (Graph) ou par un serveur SMTP classique.
 
 > **Ce que ADAdminGuard est, et n'est pas.** C'est un contrôle de conformité et un détecteur rapide : chaque
@@ -48,15 +50,16 @@ La tâche planifiée `ADAdminGuard` s'exécute en **SYSTEM** sur chaque contrôl
 | Déclencheur | Rôle |
 |---|---|
 | Événement **4728** du journal Sécurité | Ajout d'un membre à un groupe de sécurité **global** (ex. Admins du domaine) |
+| Événement **4732** du journal Sécurité | Ajout d'un membre à un groupe de sécurité **local de domaine** ou **intégré** (ex. Administrateurs, Opérateurs de sauvegarde, DnsAdmins) |
 | Événement **4756** du journal Sécurité | Ajout d'un membre à un groupe de sécurité **universel** (ex. Administrateurs de l'entreprise, du schéma) |
 | **Toutes les heures** | Rattrapage : ajout traité par un autre DC, DC arrêté, événement manqué |
 
-Tout ajout à un groupe global ou universel déclenche le contrôle, y compris l'ajout à un groupe imbriqué dans un
-groupe surveillé.
+Tout ajout à un groupe de sécurité déclenche le contrôle, y compris l'ajout à un groupe imbriqué dans un groupe
+surveillé.
 
 Dans le Planificateur de tâches, le contrôle horaire apparaît comme un déclencheur **« Une fois »** à la date
 d'installation, avec **« Après le déclenchement, recommencer toutes les 1 heure »** : il se répète sans fin. Il
-rattrape ce que le déclencheur par événement ne voit pas, puisque l'événement 4728 / 4756 n'est écrit que sur le DC
+rattrape ce que le déclencheur par événement ne voit pas, puisque l'événement 4728 / 4732 / 4756 n'est écrit que sur le DC
 qui a traité l'ajout :
 
 - ajout traité par un autre DC, sur lequel la tâche n'a pas tourné ;
@@ -70,15 +73,40 @@ autorisé en place indéfiniment.
 
 ### Règle
 
-Les groupes surveillés sont identifiés par leur **SID** (RID 512, 519 et 518), pas par leur nom : le contrôle
-fonctionne quelle que soit la langue de l'Active Directory.
+Les groupes surveillables sont les **groupes protégés** de l'AD, ceux dont Microsoft réinitialise lui-même les droits
+parce qu'ils permettent de prendre le domaine ([Appendix C: Protected Accounts and Groups in Active
+Directory](https://learn.microsoft.com/en-us/windows-server/identity/ad-ds/plan/security-best-practices/appendix-c--protected-accounts-and-groups-in-active-directory)),
+plus **DnsAdmins** :
+
+| Groupe | Identifié par | Pourquoi |
+|---|---|---|
+| Admins du domaine (Domain Admins) | RID 512 du domaine | Contrôle total du domaine |
+| Administrateurs de l'entreprise (Enterprise Admins) | RID 519 du domaine racine | Contrôle total de la forêt |
+| Administrateurs du schéma (Schema Admins) | RID 518 du domaine racine | Modification du schéma |
+| Administrateurs (intégré) | `S-1-5-32-544` | Administrateur de **tous les DC** |
+| Opérateurs de compte | `S-1-5-32-548` | Crée et modifie la plupart des comptes et groupes |
+| Opérateurs de serveur | `S-1-5-32-549` | Ouvre une session sur les DC, y gère services et fichiers |
+| Opérateurs d'impression | `S-1-5-32-550` | Ouvre une session sur les DC, peut y charger un pilote |
+| Opérateurs de sauvegarde | `S-1-5-32-551` | Peut copier la base `NTDS.dit` d'un DC, donc tous les mots de passe |
+| Duplicateurs (Replicator) | `S-1-5-32-552` | Hérité, normalement vide |
+| Administrateurs clés (Key Admins) | RID 526 du domaine | Peut ajouter une clé d'authentification à un compte (« Shadow Credentials ») |
+| Administrateurs clés Entreprise | RID 527 du domaine racine | Même chose, dans toute la forêt |
+| DnsAdmins | nom `DnsAdmins` | Peut faire charger une DLL au service DNS des DC. Non protégé par l'AD ; absent sans DNS intégré à l'AD |
+
+Le **SID** fixe rend le contrôle indépendant de la langue de l'Active Directory. DnsAdmins n'a pas de SID fixe :
+il est recherché par son nom, et ignoré avec un avertissement s'il n'existe pas.
 
 Chaque groupe surveillé est parcouru **avec ses groupes imbriqués, à tous les niveaux**. Un membre, direct ou
 indirect, n'est admis que s'il est :
 
 - l'**Administrateur intégré** (RID 500), toujours admis ;
-- ou présent dans la **liste blanche** (`whitelist.txt`), reconnu par son **SID** : renommer un compte avec le nom
-  d'un compte autorisé ne permet pas de passer.
+- ou présent dans la **liste blanche** (`whitelist.txt`) **pour ce groupe**, reconnu par son **SID** : renommer un
+  compte avec le nom d'un compte autorisé ne permet pas de passer. Un compte de sauvegarde autorisé dans les
+  Opérateurs de sauvegarde n'est pas admis chez les Admins du domaine.
+
+**Imbrication par défaut** : les Admins du domaine et les Administrateurs de l'entreprise sont membres des
+Administrateurs intégrés à l'installation de l'AD. Quand ils sont eux-mêmes surveillés, cette imbrication est admise
+sans être parcourue : leurs membres sont contrôlés au titre de leur propre groupe.
 
 Le contrôle porte sur **tout le domaine**, quel que soit l'emplacement du compte.
 
@@ -111,11 +139,11 @@ Le mode est choisi à l'installation de la tâche, enregistré dans `config.json
 | Mail | Quand | Contenu |
 |---|---|---|
 | **Alerte de quarantaine** | Un compte non autorisé est trouvé dans un groupe surveillé | Message de sensibilisation personnalisable (encadré orange), puis pour chaque compte : DN, **chemin d'appartenance** (ex. `Administrateurs de l'entreprise > G-Tier0-Admins > jdupont`), auteur et date de l'ajout, actions faites ou prévues |
-| **Information : liste blanche modifiée** | `whitelist.txt` a changé sur ce DC depuis l'exécution précédente, y compris par une modification à la main | Comptes ajoutés et retirés, avec leur SID (encadré bleu, aucune action) |
+| **Information : liste blanche modifiée** | `whitelist.txt` a changé sur ce DC depuis l'exécution précédente, y compris par une modification à la main | Comptes ajoutés, retirés ou dont les groupes autorisés ont changé, avec leur SID (encadré bleu, aucune action) |
 | **Information : ajout autorisé** | Un compte de la liste blanche (ou l'Administrateur intégré) a été ajouté à un groupe surveillé ou à un groupe imbriqué | Compte, chemin d'appartenance, auteur et date de l'ajout (encadré bleu, aucune action) |
 
 Les mails d'information sont envoyés par le DC concerné : celui dont la liste blanche a changé, ou celui qui a
-traité l'ajout (l'événement 4728 / 4756 n'est écrit que sur ce DC). Au **premier passage** après l'installation,
+traité l'ajout (l'événement 4728 / 4732 / 4756 n'est écrit que sur ce DC). Au **premier passage** après l'installation,
 le contrôle enregistre un état de référence sans envoyer de mail d'information.
 
 **Alerte de quarantaine** (ici en mode simulation) :
@@ -134,7 +162,7 @@ le contrôle enregistre un état de référence sans envoyer de mail d'informati
 
 L'alerte et le mail d'ajout autorisé indiquent qui a fait l'ajout et quand :
 
-1. l'événement 4728 / 4756 correspondant est recherché dans le journal Sécurité du DC qui exécute le contrôle ;
+1. l'événement 4728 / 4732 / 4756 correspondant est recherché dans le journal Sécurité du DC qui exécute le contrôle ;
 2. à défaut, la **date et le DC d'origine** de l'ajout sont lus dans les métadonnées de réplication de l'attribut
    `member`, puis l'événement est recherché dans le journal Sécurité de ce DC d'origine.
 
@@ -196,10 +224,11 @@ l'étape 1 n'est pas faite**. **Enregistrer** écrit `config.json` et `whitelist
 
 | Élément | Description |
 |---|---|
-| **Groupes surveillés** | Admins du domaine, Administrateurs de l'entreprise, Administrateurs du schéma. |
-| **Importer les membres actuels des groupes cochés** | Ajoute tous les membres, directs et imbriqués (groupes imbriqués compris), avec leur SID. L'Administrateur intégré n'est pas ajouté : il est toujours autorisé. |
-| **Liste** | Comptes autorisés, colonnes *Compte* et *SID*, enregistrés dans `whitelist.txt`. |
-| **Ajouter** | Le nom saisi est recherché dans l'AD pour enregistrer son SID. Un nom introuvable peut être ajouté après confirmation : il est alors comparé sur son nom seul. |
+| **Groupes surveillés** | Les douze groupes listés dans [Règle](#règle), tous cochés sur une nouvelle installation. Une configuration existante garde ses groupes : cochez les nouveaux. |
+| **Importer les membres actuels des groupes cochés** | Ajoute tous les membres, directs et imbriqués (groupes imbriqués compris), avec leur SID, chacun **autorisé dans le groupe où il a été trouvé**. L'Administrateur intégré n'est pas ajouté : il est toujours autorisé. |
+| **Liste** | Comptes autorisés, colonnes *Compte*, *Groupes autorisés* et *SID*, enregistrés dans `whitelist.txt`. |
+| **Ajouter…** | Le nom saisi est recherché dans l'AD pour enregistrer son SID, puis on coche les groupes où il est admis. Un nom introuvable peut être ajouté après confirmation : il est alors comparé sur son nom seul. |
+| **Groupes…** (ou double-clic) | Modifie les groupes autorisés des comptes sélectionnés. « Tous les groupes surveillés » (`*`) inclut ceux ajoutés plus tard : à réserver aux comptes d'administration du domaine. |
 
 À faire **avant toute mise en service** : un compte existant absent de la liste serait mis en quarantaine.
 Par sécurité, le contrôle **refuse de s'exécuter tant que `whitelist.txt` n'existe pas**.
@@ -277,7 +306,9 @@ installée.
 
 ```json
 {
-  "Groups": ["DomainAdmins", "EnterpriseAdmins", "SchemaAdmins"],
+  "Groups": ["DomainAdmins", "EnterpriseAdmins", "SchemaAdmins", "Administrators", "AccountOperators",
+             "ServerOperators", "PrintOperators", "BackupOperators", "Replicator", "KeyAdmins",
+             "EnterpriseKeyAdmins", "DnsAdmins"],
   "QuarantineOU": "OU=Quarantaine,OU=Administration,DC=contoso,DC=local",
   "SimulationMode": true,
   "MailMessage": "Les comptes ci-dessous …",
@@ -300,12 +331,16 @@ installée.
 `Method` vaut `Graph` (Microsoft 365) ou `Smtp`.
 
 ```text
-# Comptes autorisés dans les groupes surveillés par ADAdminGuard : « sAMAccountName;SID », # = commentaire.
-adm-jdupont;S-1-5-21-1111111111-2222222222-3333333333-1105
-G-Tier0-Admins;S-1-5-21-1111111111-2222222222-3333333333-1120
+# Comptes autorisés dans les groupes surveillés par ADAdminGuard : « sAMAccountName;SID;Groupes », # = commentaire.
+adm-jdupont;S-1-5-21-1111111111-2222222222-3333333333-1105;DomainAdmins,Administrators
+G-Tier0-Admins;S-1-5-21-1111111111-2222222222-3333333333-1120;DomainAdmins
+svc-sauvegarde;S-1-5-21-1111111111-2222222222-3333333333-1342;BackupOperators
 ```
 
-Une ligne sans SID (`nom` seul) est comparée sur le nom ; le journal du contrôle le signale à chaque exécution.
+*Groupes* : clés de `config.json` séparées par des virgules, ou `*` pour tous les groupes surveillés. Une ligne
+sans *Groupes* (format de la version 2.0) vaut pour les trois groupes d'origine : Admins du domaine, de
+l'entreprise et du schéma. Une ligne sans SID (`nom;;Groupes`) est comparée sur le nom ; le journal du contrôle le
+signale à chaque exécution.
 
 ---
 
@@ -372,7 +407,9 @@ Microsoft : avec un locataire Microsoft 365, préférer la méthode Graph.
 
 1. Activer l'audit sur les DC et vérifier qu'il apparaît en vert à l'étape **4. Planification**.
 2. Sur un premier DC : **importer les membres actuels** dans la liste blanche (étape 1), la relire et retirer les
-   comptes qui n'ont rien à faire dans ces groupes, puis suivre les étapes 2 et 3 et **Enregistrer**.
+   comptes qui n'ont rien à faire dans ces groupes, puis suivre les étapes 2 et 3 et **Enregistrer**. Attention
+   aux **comptes de service** (logiciel de sauvegarde, supervision…) souvent placés dans les Opérateurs de sauvegarde
+   ou les Administrateurs : autorisez-les dans ce seul groupe, sinon ils seront mis en quarantaine en mode Application.
 3. **Envoyer un mail de test** (étape 3).
 4. Installer la tâche en **Simulation** (étape 4).
 5. **Exporter** la configuration et l'**importer** sur chaque autre DC, avec le secret, puis y installer la tâche
@@ -386,8 +423,9 @@ Microsoft : avec un locataire Microsoft 365, préférer la méthode Graph.
 
 ## Ajouter un administrateur
 
-1. Sur **chaque** DC (ou sur un DC puis Exporter / Importer) : étape 1, **Ajouter** le compte à la liste blanche,
-   **Enregistrer**. Un mail « liste blanche modifiée » part de chaque DC modifié.
+1. Sur **chaque** DC (ou sur un DC puis Exporter / Importer) : étape 1, **Ajouter…** le compte à la liste blanche
+   en cochant le ou les groupes où il est admis, **Enregistrer**. Un mail « liste blanche modifiée » part de chaque
+   DC modifié.
 2. Ajouter ensuite le compte au groupe d'administration. Un mail « ajout autorisé » trace l'opération.
 
 Dans l'ordre inverse, le compte est mis en quarantaine dès son ajout au groupe.
@@ -415,7 +453,7 @@ Dans l'ordre inverse, le compte est mis en quarantaine dès son ajout au groupe.
 # Contrôle sans rien modifier : affiche les actions prévues et envoie l'alerte s'il y a lieu
 .\Invoke-ADAdminGuard.ps1 -WhatIf
 
-# Fenêtre de lecture des événements 4728/4756 (minutes, 120 par défaut) et dossier de journaux
+# Fenêtre de lecture des événements 4728/4732/4756 (minutes, 120 par défaut) et dossier de journaux
 .\Invoke-ADAdminGuard.ps1 -EventLookbackMinutes 240 -LogDir D:\Logs\ADAdminGuard
 ```
 
@@ -441,7 +479,7 @@ d'information ne sont pas envoyés et `state.json` n'est pas mis à jour.
 ## Limites connues
 
 - **Contournable par un administrateur du domaine ou du DC** : il peut désactiver la tâche ou modifier la liste
-  blanche (ce qui est signalé par mail). Superviser les événements 4728 / 4756 et les ID 1002 / 1003 dans un SIEM.
+  blanche (ce qui est signalé par mail). Superviser les événements 4728 / 4732 / 4756 et les ID 1002 / 1003 dans un SIEM.
 - **Journal Sécurité des autres DC.** En SYSTEM, la tâche agit avec le compte ordinateur du DC, qui ne peut pas lire
   par défaut le journal Sécurité d'un autre DC. L'auteur est trouvé quand l'ajout a été traité par le DC qui exécute
   le contrôle, ce qui est le cas des déclenchements par événement. Pour un rattrapage horaire d'un ajout fait

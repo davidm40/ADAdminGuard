@@ -2,11 +2,15 @@
 #Requires -Modules ActiveDirectory
 <#
 .SYNOPSIS
-    Met en quarantaine les comptes hors liste blanche ajoutés aux groupes Admins du domaine, de l'entreprise ou du schéma.
+    Met en quarantaine les comptes hors liste blanche ajoutés aux groupes à privilèges de l'AD.
 .DESCRIPTION
-    Lancé par la tâche planifiée « ADAdminGuard » (événements 4728/4756 du journal Sécurité, et toutes les heures).
-    Les groupes surveillés (config.json) sont parcourus avec leurs groupes imbriqués, à tous les niveaux.
-    Seuls y sont admis l'Administrateur intégré (RID 500) et les comptes de whitelist.txt, reconnus par leur SID.
+    Lancé par la tâche planifiée « ADAdminGuard » (événements 4728/4732/4756 du journal Sécurité, et toutes les heures).
+    Les groupes surveillés (config.json) sont parcourus avec leurs groupes imbriqués, à tous les niveaux : Admins du
+    domaine, de l'entreprise, du schéma, Administrateurs intégrés, Opérateurs de compte, de serveur, d'impression, de
+    sauvegarde, Duplicateurs, Administrateurs clés (et Entreprise), DnsAdmins.
+    Seuls y sont admis l'Administrateur intégré (RID 500) et les comptes de whitelist.txt, reconnus par leur SID, pour
+    les groupes que leur entrée désigne. Admins du domaine et de l'entreprise, membres par défaut des Administrateurs
+    intégrés, y sont admis sans être parcourus : ils sont contrôlés pour eux-mêmes.
     Le contrôle porte sur tout le domaine, quel que soit l'emplacement du compte.
     Un compte utilisateur non autorisé est retiré du groupe qui le contient directement (le groupe surveillé ou le
     groupe imbriqué), désactivé, annoté d'une description horodatée et déplacé dans l'OU de quarantaine.
@@ -18,14 +22,14 @@
       - information « liste blanche modifiée » : comptes ajoutés ou retirés de whitelist.txt sur ce DC depuis
         l'exécution précédente ;
       - information « ajout autorisé » : un compte de la liste blanche (ou l'Administrateur intégré) a été ajouté à
-        un groupe surveillé ou à un groupe imbriqué, d'après les événements 4728/4756 de ce DC.
+        un groupe surveillé ou à un groupe imbriqué, d'après les événements 4728/4732/4756 de ce DC.
     Journal Application, source ADAdminGuard : 1000 quarantaine, 1001 détection sans action, 1002 erreur,
     1003 liste blanche modifiée, 1004 ajout autorisé.
     En mode simulation (config.json) ou avec -WhatIf, rien n'est modifié dans l'AD ; l'alerte est tout de même envoyée.
     Avec -WhatIf, les mails d'information ne sont pas envoyés et state.json n'est pas mis à jour.
     Refuse de s'exécuter si whitelist.txt n'existe pas, pour ne pas mettre en quarantaine les administrateurs en place.
 .PARAMETER EventLookbackMinutes
-    Fenêtre de lecture des événements 4728/4756 (auteur des ajouts, traçabilité). 120 par défaut.
+    Fenêtre de lecture des événements 4728/4732/4756 (auteur des ajouts, traçabilité). 120 par défaut.
 .PARAMETER LogDir
     Dossier des journaux (un fichier par jour, purge après 90 jours). Par défaut : sous-dossier logs du script.
 .EXAMPLE
@@ -33,7 +37,8 @@
     Contrôle sans rien modifier, affiche ce qui serait fait et envoie l'alerte s'il y a lieu.
 .NOTES
     Configuration : Show-ADAdminGuardConfig.ps1, à lancer sur chaque contrôleur de domaine.
-    Version : 2.0 (2026-11-05) - liste blanche seule (par SID), mails d'information
+    Version : 2.1 (2026-11-06) - groupes protégés de l'AD et DnsAdmins, événement 4732, liste blanche par groupe
+              2.0 (2026-11-05) - liste blanche seule (par SID), mails d'information
 #>
 [CmdletBinding(SupportsShouldProcess)]
 param(
@@ -52,6 +57,7 @@ if (-not $LogDir) { $LogDir = Join-Path $scriptDir 'logs' }
 
 Import-Module ActiveDirectory -Verbose:$false
 Import-Module (Join-Path $scriptDir 'ADAdminGuard.psm1') -Force -Verbose:$false
+$script:GroupDefs = Get-AdagGroupDefinition
 
 function Write-Log {
     param([string]$Message, [ValidateSet('INFO', 'WARN', 'ERROR')][string]$Level = 'INFO')
@@ -126,7 +132,7 @@ $banner
 <tr><th $th>Compte</th><th $th>Appartenance</th><th $th>Ajouté par</th><th $th>Actions</th></tr>
 $($rows -join "`n")
 </table>
-<p style="color:#666;font-size:12px">Si l'ajout est légitime : ajoutez le compte à la liste blanche (Show-ADAdminGuardConfig.ps1,
+<p style="color:#666;font-size:12px">Si l'ajout est légitime : ajoutez le compte à la liste blanche, pour ce groupe (Show-ADAdminGuardConfig.ps1,
 sur chaque contrôleur de domaine), puis réactivez-le et remettez-le dans le groupe dont il a été retiré.</p>
 </body></html>
 "@
@@ -168,6 +174,15 @@ function Send-Notification {
         Write-GuardEvent -EventId 1002 -EntryType Error -Message "Échec de l'envoi du mail « $Subject » : $($_.Exception.Message)"
         $script:HasError = $true
     }
+}
+
+function Remove-QuarantineMark {
+    # Retire du début d'une description les mentions « [ADAdminGuard …] … | » ou « [PrivAdminGuard …] … | » déjà posées
+    param([AllowEmptyString()][string]$Description)
+    $d = $Description.Trim()
+    $mark = '^\[(?:ADAdminGuard|PrivAdminGuard)\b[^\]]*\][^|]*(?:\|\s*|$)'
+    while ($d -match $mark) { $d = ($d -replace $mark, '').Trim() }
+    $d
 }
 
 function Get-WhitelistKey {
@@ -213,7 +228,7 @@ try {
     $eventsRead = $true
     try {
         $events = @(Get-AdagAddEvent -Minutes $EventLookbackMinutes)
-        Write-Log "$($events.Count) ajout(s) à un groupe (4728/4756) dans le journal Sécurité sur les $EventLookbackMinutes dernières minutes"
+        Write-Log "$($events.Count) ajout(s) à un groupe (4728/4732/4756) dans le journal Sécurité sur les $EventLookbackMinutes dernières minutes"
     }
     catch {
         $events = @()
@@ -221,14 +236,22 @@ try {
         Write-Log $_.Exception.Message 'WARN'
     }
 
-    # 1. Membres directs et imbriqués de chaque groupe surveillé ; les non autorisés sont retenus
+    # 1. Membres directs et imbriqués de chaque groupe surveillé ; les non autorisés sont retenus.
+    #    L'autorisation se juge groupe par groupe : une entrée de liste blanche ne vaut que pour les groupes qu'elle désigne.
     $allEntries = New-Object System.Collections.Generic.List[object]
     $hits = New-Object System.Collections.Generic.List[object]
-    foreach ($gi in @(Get-AdagGroup -Key $cfg.Groups)) {
-        foreach ($e in @(Get-AdagEffectiveMember -GroupInfo $gi)) {
+    $groupInfos = @(Get-AdagGroup -Key $cfg.Groups -WarningVariable groupWarnings -WarningAction SilentlyContinue)
+    foreach ($w in @($groupWarnings)) { Write-Log ([string]$w) 'WARN' }
+    Write-Log ("Groupes surveillés : {0}" -f (($groupInfos | ForEach-Object { $script:GroupDefs[$_.Key].Short }) -join ', '))
+    foreach ($gi in $groupInfos) {
+        $noDescend = Get-AdagDefaultNesting -GroupInfo $groupInfos -Key $gi.Key
+        foreach ($e in @(Get-AdagEffectiveMember -GroupInfo $gi -NoDescendSid $noDescend)) {
+            $e | Add-Member -NotePropertyName GroupKey -NotePropertyValue $gi.Key
             $allEntries.Add($e)
+            # Imbrication par défaut (ex. Admins du domaine dans Administrateurs) : admise, le groupe est contrôlé pour lui-même
+            if ($e.DefaultNesting) { continue }
             # Un groupe imbriqué n'est jugé que sur la liste blanche ; ses membres sont contrôlés de toute façon
-            if (-not (Test-AdagAuthorized -Member $e.Member -Whitelist $whitelist)) { $hits.Add($e) }
+            if (-not (Test-AdagAuthorized -Member $e.Member -Whitelist $whitelist -GroupKey $gi.Key)) { $hits.Add($e) }
         }
     }
 
@@ -242,7 +265,7 @@ try {
         $groupNames = (@($entry.Group | Select-Object -ExpandProperty Path | Sort-Object -Unique) | ForEach-Object { "$_ > $label" }) -join "`n"
         $actions    = New-Object System.Collections.Generic.List[string]
 
-        # Auteur de l'ajout : événement 4728/4756 récent sur ce DC ; à défaut, date et DC d'origine lus dans les
+        # Auteur de l'ajout : événement 4728/4732/4756 récent sur ce DC ; à défaut, date et DC d'origine lus dans les
         # métadonnées de réplication, puis journal Sécurité de ce DC d'origine (distant : lisible seulement si les droits le permettent)
         $addEvent = $events | Where-Object { $m.Sid -and $_.MemberSid -eq $m.Sid } |
             Sort-Object -Property Time -Descending | Select-Object -First 1
@@ -272,9 +295,9 @@ try {
         elseif ($origin) {
             $addedOn = '{0:dd/MM/yyyy HH:mm:ss} sur {1}' -f $origin.Time, $origin.DC
             $addedBy = if ($origin.DC -ne $env:COMPUTERNAME) {
-                "inconnu : journal Sécurité de $($origin.DC) illisible depuis $env:COMPUTERNAME (événement 4728/4756 à consulter sur $($origin.DC))"
+                "inconnu : journal Sécurité de $($origin.DC) illisible depuis $env:COMPUTERNAME (événement 4728/4732/4756 à consulter sur $($origin.DC))"
             }
-            else { "inconnu : aucun événement 4728/4756 sur $env:COMPUTERNAME (audit inactif à ce moment-là ?)" }
+            else { "inconnu : aucun événement 4728/4732/4756 sur $env:COMPUTERNAME (audit inactif à ce moment-là ?)" }
         }
         else {
             $addedBy = 'inconnu'
@@ -301,7 +324,10 @@ try {
                 Disable-ADAccount -Identity $m.DistinguishedName -Server $server -Confirm:$false
             }
             $desc = '[ADAdminGuard {0:yyyy-MM-dd HH:mm}] Quarantaine : compte à privilèges hors liste blanche' -f (Get-Date)
-            if ($m.Description) { $desc = "$desc | $($m.Description)" }
+            # Une mention de quarantaine précédente (y compris de l'ancien nom PrivAdminGuard) est remplacée, pas empilée :
+            # seule la description d'origine du compte est conservée après la nouvelle mention
+            $original = Remove-QuarantineMark -Description ([string]$m.Description)
+            if ($original) { $desc = "$desc | $original" }
             if ($desc.Length -gt 1024) { $desc = $desc.Substring(0, 1024) }
             Invoke-GuardAction -Cmdlet $PSCmdlet -ActionList $actions -Target $label -Description 'Description horodatée' -Action {
                 Set-ADObject -Identity $m.DistinguishedName -Server $server -Replace @{ description = $desc } -Confirm:$false
@@ -354,12 +380,21 @@ try {
     if ($state) {
         $previous = @{}
         foreach ($w in @($state.Whitelist)) { $previous[(Get-WhitelistKey -Entry $w)] = $w }
+        # Groupes d'une entrée de l'état précédent : absents avant la v2.1, ils valaient les groupes d'origine
+        $groupsOf = { param($w) if ($w.PSObject.Properties['Groups'] -and @($w.Groups).Count) { @($w.Groups) } else { @('DomainAdmins', 'EnterpriseAdmins', 'SchemaAdmins') } }
         $added   = @($currentKeys.Keys | Where-Object { -not $previous.ContainsKey($_) } | ForEach-Object { $currentKeys[$_] })
         $removed = @($previous.Keys | Where-Object { -not $currentKeys.ContainsKey($_) } | ForEach-Object { $previous[$_] })
-        if ($added.Count -or $removed.Count) {
+        $changed = @($currentKeys.Keys | Where-Object { $previous.ContainsKey($_) -and
+                ((@(& $groupsOf $currentKeys[$_]) | Sort-Object) -join ',') -ne ((@(& $groupsOf $previous[$_]) | Sort-Object) -join ',') } |
+            ForEach-Object { $currentKeys[$_] })
+        if ($added.Count -or $removed.Count -or $changed.Count) {
             $changes = @(
-                $added   | ForEach-Object { , @('Ajouté', $_.Name, $_.Sid) }
-                $removed | ForEach-Object { , @('Retiré', $_.Name, $_.Sid) }
+                $added   | ForEach-Object { , @('Ajouté', $_.Name, $_.Sid, (Format-AdagGroupList -Groups @($_.Groups))) }
+                $removed | ForEach-Object { , @('Retiré', $_.Name, $_.Sid, (Format-AdagGroupList -Groups @(& $groupsOf $_))) }
+                $changed | ForEach-Object {
+                    $k = Get-WhitelistKey -Entry $_
+                    , @('Groupes modifiés', $_.Name, $_.Sid, ('{0} (avant : {1})' -f (Format-AdagGroupList -Groups @($_.Groups)), (Format-AdagGroupList -Groups @(& $groupsOf $previous[$k]))))
+                }
             )
             $summary = ($changes | ForEach-Object { "$($_[0]) : $($_[1])" }) -join ', '
             Write-Log "Liste blanche modifiée sur $env:COMPUTERNAME : $summary" 'WARN'
@@ -370,7 +405,7 @@ try {
                     "Les comptes ajoutés peuvent désormais être membres des groupes d'administration sans être mis en quarantaine. " +
                     "Vérifiez que la modification est prévue et qu'elle a été reportée sur les autres contrôleurs de domaine.") -f $env:COMPUTERNAME, (Get-Date)
                 Send-Notification -Subject "[ADAdminGuard] Information : liste blanche modifiée sur $env:COMPUTERNAME - $domainName" `
-                    -HtmlBody (New-InfoMailBody -Title 'Liste blanche modifiée' -Intro $intro -Header @('Modification', 'Compte', 'SID') -Row $changes)
+                    -HtmlBody (New-InfoMailBody -Title 'Liste blanche modifiée' -Intro $intro -Header @('Modification', 'Compte', 'SID', 'Groupes autorisés') -Row $changes)
             }
         }
     }
@@ -385,7 +420,7 @@ try {
         $traces = @(foreach ($ev in @($events | Where-Object { $_.RecordId -gt $lastRecord -and $privilegedGroups.ContainsKey($_.GroupSid) } | Sort-Object -Property Time)) {
             $entry = $allEntries | Where-Object { $_.Member.Sid -eq $ev.MemberSid -and $_.ParentSid -eq $ev.GroupSid } | Select-Object -First 1
             # Ajout non autorisé : déjà traité par l'alerte. Membre retiré depuis : rien à tracer.
-            if (-not $entry -or -not (Test-AdagAuthorized -Member $entry.Member -Whitelist $whitelist)) { continue }
+            if (-not $entry -or (-not $entry.DefaultNesting -and -not (Test-AdagAuthorized -Member $entry.Member -Whitelist $whitelist -GroupKey $entry.GroupKey))) { continue }
             $name = if ($entry.Member.SamAccountName) { $entry.Member.SamAccountName } else { $entry.Member.DistinguishedName }
             , @($name, "$($entry.Path) > $name", $ev.By, ('{0:dd/MM/yyyy HH:mm:ss} sur {1}' -f $ev.Time, $ev.Computer))
         })
@@ -409,7 +444,7 @@ try {
         Save-AdagState -State ([pscustomobject]@{
             UpdatedAt         = (Get-Date).ToString('s')
             LastEventRecordId = $maxRecord
-            Whitelist         = @($whitelist | Select-Object -Property Name, Sid)
+            Whitelist         = @($whitelist | Select-Object -Property Name, Sid, Groups)
         }) -Confirm:$false
     }
 

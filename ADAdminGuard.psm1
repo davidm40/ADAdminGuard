@@ -20,12 +20,29 @@ $script:EventSource   = 'ADAdminGuard'
 # Entropie ajoutée au chiffrement DPAPI : le secret ne se déchiffre pas par un simple appel sans elle
 $script:Entropy       = [Text.Encoding]::UTF8.GetBytes('ADAdminGuard/DPAPI')
 
-# Groupes surveillés, désignés par RID : indépendant de la langue de l'AD (« Admins du domaine »…)
+# Groupes surveillés : groupes protégés de l'AD (Microsoft, « Appendix C: Protected Accounts and Groups in Active
+# Directory ») et DnsAdmins. Désignés par SID quand il est fixe : indépendant de la langue de l'AD.
+#   Scope Domain  : SID du domaine + RID       Scope Forest : SID du domaine racine de la forêt + RID
+#   Scope Builtin : S-1-5-32-RID (groupe intégré, local au domaine : ajout = événement 4732)
+#   Scope Name    : recherché par sAMAccountName (DnsAdmins n'a pas de RID fixe ; absent sans DNS intégré à l'AD)
+# AllowedIn : groupes surveillés où ce groupe est imbriqué par défaut (Admins du domaine et de l'entreprise sont membres
+# des Administrateurs intégrés). Cette imbrication est admise sans être parcourue : le groupe est contrôlé pour lui-même.
 $script:GroupDefinitions = [ordered]@{
-    DomainAdmins     = @{ Rid = 512; Scope = 'Domain'; Label = 'Admins du domaine (Domain Admins)' }
-    EnterpriseAdmins = @{ Rid = 519; Scope = 'Forest'; Label = "Administrateurs de l'entreprise (Enterprise Admins)" }
-    SchemaAdmins     = @{ Rid = 518; Scope = 'Forest'; Label = 'Administrateurs du schéma (Schema Admins)' }
+    DomainAdmins        = @{ Rid = 512; Scope = 'Domain';  Short = 'Admins du domaine'; Label = 'Admins du domaine (Domain Admins)'; AllowedIn = @('Administrators') }
+    EnterpriseAdmins    = @{ Rid = 519; Scope = 'Forest';  Short = "Admins de l'entreprise"; Label = "Administrateurs de l'entreprise (Enterprise Admins)"; AllowedIn = @('Administrators') }
+    SchemaAdmins        = @{ Rid = 518; Scope = 'Forest';  Short = 'Admins du schéma'; Label = 'Administrateurs du schéma (Schema Admins)'; AllowedIn = @() }
+    Administrators      = @{ Rid = 544; Scope = 'Builtin'; Short = 'Administrateurs'; Label = 'Administrateurs intégrés (Administrators)'; AllowedIn = @() }
+    AccountOperators    = @{ Rid = 548; Scope = 'Builtin'; Short = 'Opérateurs de compte'; Label = 'Opérateurs de compte (Account Operators)'; AllowedIn = @() }
+    ServerOperators     = @{ Rid = 549; Scope = 'Builtin'; Short = 'Opérateurs de serveur'; Label = 'Opérateurs de serveur (Server Operators)'; AllowedIn = @() }
+    PrintOperators      = @{ Rid = 550; Scope = 'Builtin'; Short = "Opérateurs d'impression"; Label = "Opérateurs d'impression (Print Operators)"; AllowedIn = @() }
+    BackupOperators     = @{ Rid = 551; Scope = 'Builtin'; Short = 'Opérateurs de sauvegarde'; Label = 'Opérateurs de sauvegarde (Backup Operators)'; AllowedIn = @() }
+    Replicator          = @{ Rid = 552; Scope = 'Builtin'; Short = 'Duplicateurs'; Label = 'Duplicateurs (Replicator)'; AllowedIn = @() }
+    KeyAdmins           = @{ Rid = 526; Scope = 'Domain';  Short = 'Admins clés'; Label = 'Administrateurs clés (Key Admins)'; AllowedIn = @() }
+    EnterpriseKeyAdmins = @{ Rid = 527; Scope = 'Forest';  Short = 'Admins clés Entreprise'; Label = 'Administrateurs clés Entreprise (Enterprise Key Admins)'; AllowedIn = @() }
+    DnsAdmins           = @{ Name = 'DnsAdmins'; Scope = 'Name'; Short = 'DnsAdmins'; Label = 'DnsAdmins (non protégé par l''AD)'; AllowedIn = @() }
 }
+# Groupes d'origine (v1/v2.0) : une entrée de liste blanche sans liste de groupes (ancien format) y est admise
+$script:LegacyGroups = @('DomainAdmins', 'EnterpriseAdmins', 'SchemaAdmins')
 
 # Modèles du message de sensibilisation placé en tête du mail (personnalisable dans le configurateur)
 $script:MailTemplates = [ordered]@{
@@ -57,7 +74,7 @@ function Get-AdagEventSource { $script:EventSource }
 
 function New-AdagDefaultConfig {
     [pscustomobject]@{
-        Groups         = @('DomainAdmins', 'EnterpriseAdmins', 'SchemaAdmins')
+        Groups         = @($script:GroupDefinitions.Keys)
         QuarantineOU   = ''
         SimulationMode = $true
         MailMessage    = $script:MailTemplates['Rappel de la politique']
@@ -82,7 +99,8 @@ function Get-AdagConfig {
     if (-not (Test-Path -LiteralPath $script:ConfigPath)) { return $default }
 
     $cfg = Get-Content -LiteralPath $script:ConfigPath -Raw -Encoding UTF8 | ConvertFrom-Json
-    # Complète les clés absentes (config issue d'une version antérieure)
+    # Complète les clés absentes (config issue d'une version antérieure). Une config existante garde sa liste de
+    # groupes : les nouveaux groupes surveillables s'activent dans le configurateur.
     foreach ($p in $default.PSObject.Properties) {
         if (-not $cfg.PSObject.Properties[$p.Name]) { $cfg | Add-Member -NotePropertyName $p.Name -NotePropertyValue $p.Value }
     }
@@ -130,14 +148,35 @@ function Test-AdagMailConfigured {
 
 #region Liste blanche
 
+function ConvertTo-AdagGroupList {
+    # Texte « DomainAdmins,BackupOperators » ou « * » -> tableau de clés ; vide -> groupes d'origine (ancien format)
+    param([AllowEmptyString()][string]$Text)
+    $keys = @($Text -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+    if (-not $keys.Count) { return $script:LegacyGroups }
+    $keys
+}
+
+function Format-AdagGroupList {
+    # Clés -> libellés courts, pour l'affichage (« Tous les groupes » pour *)
+    param([AllowEmptyCollection()][string[]]$Groups = @())
+    if ($Groups -contains '*') { return 'Tous les groupes' }
+    (@($Groups | ForEach-Object { if ($script:GroupDefinitions.Contains($_)) { $script:GroupDefinitions[$_].Short } else { $_ } })) -join ', '
+}
+
 function Get-AdagWhitelist {
-    # Entrées { Name; Sid }. Une ligne sans SID (ancien format ou compte introuvable) est comparée sur le nom seul.
+    # Entrées { Name; Sid; Groups }. Ligne « nom;SID;Groupes » : Groupes = clés séparées par des virgules, ou * pour tous.
+    # Une ligne sans Groupes (format v2.0) vaut pour les trois groupes d'origine. Une ligne sans SID (compte introuvable)
+    # est comparée sur le nom seul.
     if (-not (Test-Path -LiteralPath $script:WhitelistPath)) { return @() }
     foreach ($line in Get-Content -LiteralPath $script:WhitelistPath -Encoding UTF8) {
         $line = ($line -replace '#.*$', '').Trim()
         if (-not $line) { continue }
-        $parts = $line -split ';', 2
-        [pscustomobject]@{ Name = $parts[0].Trim(); Sid = if ($parts.Count -gt 1) { $parts[1].Trim() } else { '' } }
+        $parts = $line -split ';', 3
+        [pscustomobject]@{
+            Name   = $parts[0].Trim()
+            Sid    = if ($parts.Count -gt 1) { $parts[1].Trim() } else { '' }
+            Groups = @(ConvertTo-AdagGroupList -Text $(if ($parts.Count -gt 2) { $parts[2] } else { '' }))
+        }
     }
 }
 
@@ -145,22 +184,25 @@ function Save-AdagWhitelist {
     [CmdletBinding(SupportsShouldProcess)]
     param([AllowEmptyCollection()][object[]]$Entry = @())
     $header = @(
-        '# Comptes autorisés dans les groupes surveillés par ADAdminGuard : « sAMAccountName;SID », # = commentaire.'
+        '# Comptes autorisés dans les groupes surveillés par ADAdminGuard : « sAMAccountName;SID;Groupes », # = commentaire.'
+        '# Groupes : clés séparées par des virgules (ex. DomainAdmins,BackupOperators), ou * pour tous les groupes surveillés.'
         '# Le SID fait foi : renommer un compte ne permet pas de se faire passer pour un compte autorisé.'
         "# Mis à jour le $(Get-Date -Format 'yyyy-MM-dd HH:mm') par $env:USERDOMAIN\$env:USERNAME"
     )
-    $lines = @($Entry | Sort-Object -Property Name -Unique | ForEach-Object { if ($_.Sid) { "$($_.Name);$($_.Sid)" } else { $_.Name } })
+    $lines = @($Entry | Sort-Object -Property Name -Unique | ForEach-Object { '{0};{1};{2}' -f $_.Name, $_.Sid, (@($_.Groups) -join ',') })
     if ($PSCmdlet.ShouldProcess($script:WhitelistPath, 'Enregistrer la liste blanche')) {
         Set-Content -LiteralPath $script:WhitelistPath -Value ($header + $lines) -Encoding UTF8
     }
 }
 
 function Test-AdagAuthorized {
-    # Compte admis dans un groupe surveillé : Administrateur intégré (RID 500) ou présent dans la liste blanche.
-    # Comparaison sur le SID quand l'entrée en a un, sinon sur le nom.
-    param([Parameter(Mandatory)] $Member, [AllowEmptyCollection()][object[]]$Whitelist = @())
+    # Compte admis dans le groupe surveillé GroupKey : Administrateur intégré (RID 500), ou entrée de liste blanche qui
+    # désigne ce groupe (ou *). Comparaison sur le SID quand l'entrée en a un, sinon sur le nom.
+    param([Parameter(Mandatory)] $Member, [AllowEmptyCollection()][object[]]$Whitelist = @(), [Parameter(Mandatory)][string]$GroupKey)
     if ($Member.Sid -like '*-500') { return $true }
     foreach ($w in $Whitelist) {
+        $groups = @($w.Groups)
+        if ($groups -notcontains '*' -and $groups -notcontains $GroupKey) { continue }
         if ($w.Sid) { if ($Member.Sid -and $w.Sid -eq $Member.Sid) { return $true } }
         elseif ($Member.SamAccountName -and $w.Name -eq $Member.SamAccountName) { return $true }
     }
@@ -196,7 +238,7 @@ function Export-AdagPackage {
         ExportedBy = "$env:USERDOMAIN\$env:USERNAME"
         Source     = $env:COMPUTERNAME
         Config     = $c
-        Whitelist  = @($Whitelist | Select-Object -Property Name, Sid)
+        Whitelist  = @($Whitelist | Select-Object -Property Name, Sid, @{ n = 'Groups'; e = { @($_.Groups) -join ',' } })
     } | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $Path -Encoding UTF8
 }
 
@@ -207,7 +249,9 @@ function Import-AdagPackage {
     if (-not $p.PSObject.Properties['Product'] -or $p.Product -ne 'ADAdminGuard') { throw "Ce fichier n'est pas un export ADAdminGuard." }
     [pscustomobject]@{
         Config     = $p.Config
-        Whitelist  = @($p.Whitelist | Where-Object { $_ } | ForEach-Object { [pscustomobject]@{ Name = [string]$_.Name; Sid = [string]$_.Sid } })
+        Whitelist  = @($p.Whitelist | Where-Object { $_ } | ForEach-Object {
+                $g = if ($_.PSObject.Properties['Groups']) { [string]$_.Groups } else { '' }
+                [pscustomobject]@{ Name = [string]$_.Name; Sid = [string]$_.Sid; Groups = @(ConvertTo-AdagGroupList -Text $g) } })
         Source     = [string]$p.Source
         ExportedAt = [string]$p.ExportedAt
     }
@@ -371,7 +415,8 @@ function Test-AdagInContainer {
 }
 
 function Get-AdagGroup {
-    # Renvoie les groupes surveillés : clé, libellé, objet ADGroup (avec member) et serveur à interroger
+    # Renvoie les groupes surveillés : clé, libellé, SID, objet ADGroup (avec member) et serveur à interroger.
+    # Un groupe recherché par nom (DnsAdmins) et absent du domaine est ignoré avec un avertissement.
     param([Parameter(Mandatory)][string[]]$Key)
     $domain = Get-ADDomain
     $forest = Get-ADForest
@@ -381,13 +426,35 @@ function Get-AdagGroup {
         if (-not $script:GroupDefinitions.Contains($k)) { throw "Groupe inconnu dans la configuration : $k" }
         $def = $script:GroupDefinitions[$k]
         $d = if ($def.Scope -eq 'Forest') { $rootDomain } else { $domain }
+        $group = switch ($def.Scope) {
+            'Builtin' { Get-ADGroup -Identity "S-1-5-32-$($def.Rid)" -Server $d.DNSRoot -Properties member }
+            'Name' {
+                $n = [string]$def.Name
+                Get-ADGroup -Filter "sAMAccountName -eq '$n'" -Server $d.DNSRoot -Properties member | Select-Object -First 1
+            }
+            default { Get-ADGroup -Identity "$($d.DomainSID.Value)-$($def.Rid)" -Server $d.DNSRoot -Properties member }
+        }
+        if (-not $group) { Write-Warning "Groupe $($def.Label) introuvable dans $($d.DNSRoot) : ignoré."; continue }
         [pscustomobject]@{
             Key    = $k
             Label  = $def.Label
+            Sid    = [string]$group.SID.Value
             Server = $d.DNSRoot
-            Group  = Get-ADGroup -Identity "$($d.DomainSID.Value)-$($def.Rid)" -Server $d.DNSRoot -Properties member
+            Group  = $group
         }
     }
+}
+
+function Get-AdagDefaultNesting {
+    # SID des groupes surveillés imbriqués par défaut dans le groupe Key (ex. Admins du domaine dans Administrateurs) :
+    # à passer à Get-AdagEffectiveMember -NoDescendSid. Seuls les groupes eux-mêmes surveillés sont concernés : sinon
+    # leurs membres doivent être contrôlés au titre du groupe qui les contient.
+    param([Parameter(Mandatory)][AllowEmptyCollection()][object[]]$GroupInfo, [Parameter(Mandatory)][string]$Key)
+    $h = @{}
+    foreach ($gi in $GroupInfo) {
+        if ($gi.Sid -and @($script:GroupDefinitions[$gi.Key].AllowedIn) -contains $Key) { $h[$gi.Sid] = $gi.Key }
+    }
+    $h
 }
 
 function ConvertTo-AdagMember {
@@ -416,7 +483,9 @@ function Get-AdagEffectiveMember {
     # Membres directs et imbriqués d'un groupe surveillé. Chaque objet est renvoyé avec le groupe qui le contient
     # directement (Parent*, celui dont il faut le retirer) et son chemin d'appartenance depuis le groupe surveillé.
     # Un groupe déjà parcouru n'est pas relu : les imbrications circulaires ne bouclent pas.
-    param([Parameter(Mandatory)] $GroupInfo)
+    # -NoDescendSid : SID de groupes à ne pas parcourir (groupes surveillés imbriqués par défaut, ex. Admins du domaine
+    # dans Administrateurs) ; ils sont renvoyés comme membres, avec DefaultNesting = $true.
+    param([Parameter(Mandatory)] $GroupInfo, [hashtable]$NoDescendSid = @{})
     $rootDN  = [string]$GroupInfo.Group.DistinguishedName
     $rootSid = $GroupInfo.Group.PSObject.Properties['SID']
     $rootSid = if ($rootSid -and $rootSid.Value) { [string]$rootSid.Value } else { '' }
@@ -432,16 +501,18 @@ function Get-AdagEffectiveMember {
         $parent = $pending.Dequeue()
         foreach ($dn in $parent.Members) {
             $m = ConvertTo-AdagMember -DistinguishedName $dn
+            $default = $parent.DN -eq $rootDN -and $m.Sid -and $NoDescendSid.ContainsKey($m.Sid)
             [pscustomobject]@{
-                Member       = $m
-                ParentDN     = $parent.DN
-                ParentSid    = $parent.Sid
-                ParentName   = $parent.Name
-                ParentServer = $parent.Server
-                Path         = $parent.Path
-                Nested       = $parent.DN -ne $rootDN
+                Member         = $m
+                ParentDN       = $parent.DN
+                ParentSid      = $parent.Sid
+                ParentName     = $parent.Name
+                ParentServer   = $parent.Server
+                Path           = $parent.Path
+                Nested         = $parent.DN -ne $rootDN
+                DefaultNesting = [bool]$default
             }
-            if ($m.ObjectClass -eq 'group' -and $visited.Add($m.DistinguishedName)) {
+            if ($m.ObjectClass -eq 'group' -and -not $default -and $visited.Add($m.DistinguishedName)) {
                 $name = if ($m.SamAccountName) { $m.SamAccountName } else { $m.DistinguishedName }
                 $pending.Enqueue([pscustomobject]@{
                     DN = $m.DistinguishedName; Sid = $m.Sid; Name = $name; Path = "$($parent.Path) > $name"; Members = $m.Members
@@ -453,7 +524,8 @@ function Get-AdagEffectiveMember {
 }
 
 function Get-AdagAddEvent {
-    # Ajouts à un groupe de sécurité global (4728) ou universel (4756) dans le journal Sécurité de ce serveur,
+    # Ajouts à un groupe de sécurité global (4728), local de domaine ou intégré (4732) ou universel (4756) dans le
+    # journal Sécurité de ce serveur,
     # ou d'un autre DC avec -ComputerName. Lève une erreur si le journal est illisible (droits, RPC) :
     # « aucun événement » et « journal inaccessible » ne doivent pas se confondre.
     param([int]$Minutes = 120, [datetime]$Since, [string]$ComputerName)
@@ -465,7 +537,7 @@ function Get-AdagAddEvent {
     try { [void](Get-WinEvent -ListLog Security @target -ErrorAction Stop) }
     catch { throw "Lecture du journal Sécurité de $where impossible : $($_.Exception.Message)" }
 
-    $query = @{ FilterHashtable = @{ LogName = 'Security'; Id = 4728, 4756; StartTime = $start } } + $target
+    $query = @{ FilterHashtable = @{ LogName = 'Security'; Id = 4728, 4732, 4756; StartTime = $start } } + $target
     try { $raw = @(Get-WinEvent @query -ErrorAction Stop) }
     catch {
         if ($_.FullyQualifiedErrorId -like 'NoMatchingEventsFound*') { return }
@@ -539,14 +611,14 @@ function Get-AdagTaskState {
 }
 
 function Register-AdagTask {
-    # Tâche SYSTEM déclenchée par les événements 4728/4756 + contrôle de rattrapage toutes les heures.
+    # Tâche SYSTEM déclenchée par les événements 4728/4732/4756 + contrôle de rattrapage toutes les heures.
     # Restreint aussi les droits du dossier (SYSTEM et Administrateurs) : le script tourne en SYSTEM sur un DC.
     [CmdletBinding(SupportsShouldProcess)]
     param()
     $scriptPath = Join-Path $script:Root 'Invoke-ADAdminGuard.ps1'
 
     $eventTrigger = New-CimInstance -CimClass (Get-CimClass -ClassName MSFT_TaskEventTrigger -Namespace 'Root/Microsoft/Windows/TaskScheduler') -ClientOnly
-    $eventTrigger.Subscription = '<QueryList><Query Id="0" Path="Security"><Select Path="Security">*[System[(EventID=4728 or EventID=4756)]]</Select></Query></QueryList>'
+    $eventTrigger.Subscription = '<QueryList><Query Id="0" Path="Security"><Select Path="Security">*[System[(EventID=4728 or EventID=4732 or EventID=4756)]]</Select></Query></QueryList>'
     $eventTrigger.Enabled = $true
     $sweepTrigger = New-ScheduledTaskTrigger -Once -At (Get-Date).Date -RepetitionInterval (New-TimeSpan -Hours 1)
 
@@ -571,7 +643,7 @@ function Register-AdagTask {
     if ($PSCmdlet.ShouldProcess($script:TaskName, 'Créer ou mettre à jour la tâche planifiée')) {
         Register-ScheduledTask -TaskName $script:TaskName -TaskPath '\' -Action $action -Trigger @($eventTrigger, $sweepTrigger) `
             -Principal $principal -Settings $settings -Force `
-            -Description 'Met en quarantaine les comptes hors liste blanche ajoutés aux groupes Admins du domaine / entreprise / schéma.' | Out-Null
+            -Description "Met en quarantaine les comptes hors liste blanche ajoutés aux groupes à privilèges de l'AD (Admins du domaine, de l'entreprise, du schéma, Administrateurs, Opérateurs…)." | Out-Null
     }
 }
 

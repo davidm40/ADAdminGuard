@@ -5,7 +5,8 @@
     Configurateur graphique d'ADAdminGuard, en quatre étapes guidées.
 .DESCRIPTION
     Ouvre une fenêtre à quatre étapes numérotées, parcourues avec Précédent / Suivant ou directement par les onglets :
-      1. Liste blanche  : groupes surveillés, comptes autorisés (whitelist.txt, avec leur SID), import des membres actuels ;
+      1. Liste blanche  : groupes surveillés, comptes autorisés et leurs groupes (whitelist.txt, avec leur SID),
+                          import des membres actuels ;
       2. Message        : message de sensibilisation en tête de l'alerte de quarantaine (modèles ou texte personnalisé) ;
       3. Notification   : envoi par Microsoft 365 (Graph) ou par serveur SMTP, destinataires, mail de test ;
       4. Planification  : OU de quarantaine, audit, installation de la tâche (simulation ou application), tests,
@@ -16,7 +17,8 @@
 .EXAMPLE
     .\Show-ADAdminGuardConfig.ps1
 .NOTES
-    Version : 2.0 (2026-11-05) - liste blanche seule (par SID), export / import
+    Version : 2.1 (2026-11-06) - groupes protégés de l'AD et DnsAdmins, groupes autorisés par compte
+              2.0 (2026-11-05) - liste blanche seule (par SID), export / import
 #>
 [CmdletBinding()]
 param()
@@ -139,17 +141,67 @@ function Get-WhitelistEntry {
     @($lvWhite.Items | ForEach-Object { $_.Tag })
 }
 
+function Set-WhitelistItemGroups {
+    # Met à jour les groupes d'une ligne de la liste affichée (objet Tag et colonne « Groupes autorisés »)
+    param([Parameter(Mandatory)] $Item, [Parameter(Mandatory)][string[]]$Groups)
+    $g = if ($Groups -contains '*') { @('*') } else { @($groupDefs.Keys | Where-Object { $Groups -contains $_ }) }
+    $Item.Tag.Groups = $g
+    $Item.SubItems[1].Text = Format-AdagGroupList -Groups $g
+}
+
 function Add-WhitelistEntry {
-    # Ajoute une ligne (nom, SID) à la liste affichée ; renvoie $false si le compte y est déjà
-    param([Parameter(Mandatory)][string]$Name, [AllowEmptyString()][string]$Sid)
-    foreach ($w in Get-WhitelistEntry) {
-        if (($Sid -and $w.Sid -eq $Sid) -or (-not $Sid -and $w.Name -eq $Name)) { return $false }
+    # Ajoute une ligne (nom, SID, groupes) à la liste affichée. Si le compte y est déjà, ses groupes sont complétés.
+    # Renvoie 'ajouté', 'complété' ou 'inchangé'.
+    param([Parameter(Mandatory)][string]$Name, [AllowEmptyString()][string]$Sid, [Parameter(Mandatory)][string[]]$Groups)
+    foreach ($item in @($lvWhite.Items)) {
+        $w = $item.Tag
+        if (($Sid -and $w.Sid -eq $Sid) -or (-not $Sid -and $w.Name -eq $Name)) {
+            $union = @(@($w.Groups) + $Groups | Sort-Object -Unique)
+            if (@($w.Groups) -contains '*' -or (@($union).Count -eq @($w.Groups).Count)) { return 'inchangé' }
+            Set-WhitelistItemGroups -Item $item -Groups $union
+            return 'complété'
+        }
     }
     $item = New-Object Windows.Forms.ListViewItem($Name)
+    [void]$item.SubItems.Add('')
     [void]$item.SubItems.Add($(if ($Sid) { $Sid } else { '(SID inconnu : comparé sur le nom)' }))
-    $item.Tag = [pscustomobject]@{ Name = $Name; Sid = $Sid }
+    $item.Tag = [pscustomobject]@{ Name = $Name; Sid = $Sid; Groups = @() }
+    Set-WhitelistItemGroups -Item $item -Groups $Groups
     [void]$lvWhite.Items.Add($item)
-    $true
+    'ajouté'
+}
+
+function Select-WhitelistGroup {
+    # Fenêtre de choix des groupes où un compte est autorisé. Renvoie les clés choisies (ou @('*')), ou $null si annulé.
+    param([Parameter(Mandatory)][string]$Title, [AllowEmptyCollection()][string[]]$Selected = @())
+    $dlg = New-Object Windows.Forms.Form
+    $dlg.Text = 'ADAdminGuard'
+    $dlg.ClientSize = New-Object Drawing.Size(470, 420)
+    $dlg.StartPosition = 'CenterParent'
+    $dlg.FormBorderStyle = 'FixedDialog'
+    $dlg.MinimizeBox = $false; $dlg.MaximizeBox = $false; $dlg.ShowInTaskbar = $false
+    $dlg.Font = $form.Font
+    $dlg.Icon = $form.Icon
+    [void](Add-Control -Parent $dlg -Type Label -X 12 -Y 10 -Width 446 -Height 36 -Text $Title)
+    $clb = Add-Control -Parent $dlg -Type CheckedListBox -X 12 -Y 50 -Width 446 -Height 300
+    $clb.CheckOnClick = $true
+    $all = 'Tous les groupes surveillés, y compris ceux ajoutés plus tard'
+    [void]$clb.Items.Add($all, ($Selected -contains '*'))
+    foreach ($k in $groupDefs.Keys) { [void]$clb.Items.Add($groupDefs[$k].Label, ($Selected -contains $k)) }
+    $hint = Add-Control -Parent $dlg -Type Label -X 12 -Y 352 -Width 446 -Height 30 -Text "Accordez le moins de groupes possible : un compte de service n'a souvent besoin que d'un seul."
+    $hint.ForeColor = 'DimGray'
+    $ok = Add-Control -Parent $dlg -Type Button -X 248 -Y 385 -Width 100 -Height 28 -Text 'OK'; $ok.DialogResult = 'OK'
+    $cancel = Add-Control -Parent $dlg -Type Button -X 358 -Y 385 -Width 100 -Height 28 -Text 'Annuler'; $cancel.DialogResult = 'Cancel'
+    $dlg.AcceptButton = $ok; $dlg.CancelButton = $cancel
+    $result = $dlg.ShowDialog($form)
+    $keys = @($groupDefs.Keys)
+    $chosen = @(for ($i = 1; $i -lt $clb.Items.Count; $i++) { if ($clb.GetItemChecked($i)) { $keys[$i - 1] } })
+    $star = $clb.GetItemChecked(0)
+    $dlg.Dispose()
+    if ([string]$result -ne 'OK') { return $null }
+    if ($star) { return , @('*') }
+    if (-not $chosen.Count) { Show-Message -Text 'Aucun groupe coché : rien n''est modifié.' -Icon Warning; return $null }
+    , $chosen
 }
 
 function Get-SecretValue {
@@ -190,7 +242,7 @@ function Set-FormFromConfig {
     param([Parameter(Mandatory)] $Config, [AllowEmptyCollection()][object[]]$Whitelist = @())
     foreach ($k in $script:GroupChecks.Keys) { $script:GroupChecks[$k].Checked = @($Config.Groups) -contains $k }
     $lvWhite.Items.Clear()
-    foreach ($w in $Whitelist) { [void](Add-WhitelistEntry -Name $w.Name -Sid $w.Sid) }
+    foreach ($w in $Whitelist) { [void](Add-WhitelistEntry -Name $w.Name -Sid $w.Sid -Groups @($w.Groups)) }
     $cmbQuar.Text = [string]$Config.QuarantineOU
     $script:SimulationMode = [bool]$Config.SimulationMode
     $script:TemplateSync = $true
@@ -257,7 +309,7 @@ function Update-AuditState {
     $script:AuditState = Get-AdagAuditState
     $head = "Audit « Gestion des groupes de sécurité » : $($script:AuditState.Text)"
     if ($script:AuditState.Enabled -eq $true) {
-        $lblAudit.Text = "$head`r`nLes ajouts aux groupes génèrent bien les événements 4728/4756."
+        $lblAudit.Text = "$head`r`nLes ajouts aux groupes génèrent bien les événements 4728/4732/4756."
         $lblAudit.ForeColor = 'DarkGreen'
     }
     elseif ($script:AuditState.Enabled -eq $false) {
@@ -366,38 +418,43 @@ for ($i = 0; $i -lt $stepTitles.Count; $i++) { $tabs.TabPages[$i].Text = $stepTi
 
 #region Étape 1 : liste blanche
 
-Add-StepIntro -Parent $tabWhite -Text ("Étape 1 - Recensez les comptes autorisés dans les groupes surveillés. Tout autre compte qui y " +
-    "entre, directement ou par un groupe imbriqué, est mis en quarantaine ; l'Administrateur intégré est toujours autorisé.")
+Add-StepIntro -Parent $tabWhite -Text ("Étape 1 - Cochez les groupes à surveiller et recensez, pour chaque compte autorisé, les groupes où il " +
+    "est admis. Tout autre membre, direct ou imbriqué, est mis en quarantaine ; l'Administrateur intégré est toujours autorisé.")
 
-[void](Add-Control -Parent $tabWhite -Type Label -X 10 -Y 48 -Width 400 -Text 'Groupes surveillés :')
+[void](Add-Control -Parent $tabWhite -Type Label -X 10 -Y 46 -Width 300 -Text 'Groupes surveillés :')
+$btnImport = Add-Control -Parent $tabWhite -Type Button -X 400 -Y 42 -Width 300 -Height 24 -Text 'Importer les membres actuels des groupes cochés'
 $script:GroupChecks = [ordered]@{}
-$y = 68
+$i = 0
 foreach ($k in $groupDefs.Keys) {
-    $chk = Add-Control -Parent $tabWhite -Type CheckBox -X 20 -Y $y -Width 460 -Text $groupDefs[$k].Label
+    # Deux colonnes de six
+    $x = if ($i -lt 6) { 20 } else { 360 }
+    $y = 70 + ($i % 6) * 21
+    $chk = Add-Control -Parent $tabWhite -Type CheckBox -X $x -Y $y -Width 335 -Text $groupDefs[$k].Label
     $chk.Add_CheckedChanged({ Update-StepState })
     $script:GroupChecks[$k] = $chk
-    $y += 22
+    $i++
 }
-$btnImport = Add-Control -Parent $tabWhite -Type Button -X 500 -Y 66 -Width 200 -Height 60 -Text 'Importer les membres actuels des groupes cochés'
 
-[void](Add-Control -Parent $tabWhite -Type Label -X 10 -Y 140 -Width 690 -Text 'Comptes autorisés, enregistrés dans whitelist.txt (le SID fait foi, pas le nom) :')
-$lvWhite = Add-Control -Parent $tabWhite -Type ListView -X 10 -Y 162 -Width 570 -Height 200
+[void](Add-Control -Parent $tabWhite -Type Label -X 10 -Y 202 -Width 690 -Text 'Comptes autorisés, enregistrés dans whitelist.txt (le SID fait foi, pas le nom) :')
+$lvWhite = Add-Control -Parent $tabWhite -Type ListView -X 10 -Y 222 -Width 570 -Height 160
 $lvWhite.View = 'Details'
 $lvWhite.FullRowSelect = $true
 $lvWhite.MultiSelect = $true
 $lvWhite.HideSelection = $false
 $lvWhite.Sorting = 'Ascending'
-[void]$lvWhite.Columns.Add('Compte', 180)
-[void]$lvWhite.Columns.Add('SID', 365)
-$btnWhiteRemove = Add-Control -Parent $tabWhite -Type Button -X 590 -Y 162 -Width 110 -Text 'Retirer'
+[void]$lvWhite.Columns.Add('Compte', 130)
+[void]$lvWhite.Columns.Add('Groupes autorisés', 190)
+[void]$lvWhite.Columns.Add('SID', 225)
+$btnWhiteGroups = Add-Control -Parent $tabWhite -Type Button -X 590 -Y 222 -Width 110 -Text 'Groupes…'
+$btnWhiteRemove = Add-Control -Parent $tabWhite -Type Button -X 590 -Y 252 -Width 110 -Text 'Retirer'
 
-$txtWhite = Add-Control -Parent $tabWhite -Type TextBox -X 10 -Y 372 -Width 570
-$btnWhiteAdd = Add-Control -Parent $tabWhite -Type Button -X 590 -Y 371 -Width 110 -Text 'Ajouter'
+$txtWhite = Add-Control -Parent $tabWhite -Type TextBox -X 10 -Y 390 -Width 570
+$btnWhiteAdd = Add-Control -Parent $tabWhite -Type Button -X 590 -Y 389 -Width 110 -Text 'Ajouter…'
 
-$lblWhiteHint = Add-Control -Parent $tabWhite -Type Label -X 10 -Y 405 -Width 690 -Height 70 -Text (
-    "Un compte ajouté est recherché dans l'AD pour enregistrer son SID. Un groupe de la liste peut rester imbriqué, mais ses " +
-    "membres sont contrôlés un par un. Toute modification de la liste déclenche un mail d'information.`r`n" +
-    "La liste est propre à ce DC : reportez-la sur les autres avec Exporter / Importer (étape 4).")
+$lblWhiteHint = Add-Control -Parent $tabWhite -Type Label -X 10 -Y 420 -Width 690 -Height 62 -Text (
+    "Un compte n'est admis que dans les groupes de sa ligne : un compte de sauvegarde autorisé dans les Opérateurs de sauvegarde " +
+    "ne l'est pas chez les Admins du domaine. Admins du domaine et de l'entreprise, membres par défaut des Administrateurs, y sont admis d'office. " +
+    "Toute modification de la liste déclenche un mail d'information. Liste propre à ce DC : Exporter / Importer (étape 4).")
 $lblWhiteHint.ForeColor = 'DimGray'
 
 $btnWhiteAdd.Add_Click({
@@ -408,13 +465,25 @@ $btnWhiteAdd.Add_Click({
     if ($found.Count) { $sid = [string]$found[0].objectSid.Value }
     elseif (-not (Confirm-Action -Text ("Aucun objet « $n » trouvé dans le domaine. L'ajouter quand même ?`r`n`r`n" +
             "Sans SID, il sera comparé sur son nom seul : un autre compte renommé ainsi serait aussi autorisé."))) { return }
-    if (-not (Add-WhitelistEntry -Name $(if ($found.Count) { [string]$found[0].sAMAccountName } else { $n }) -Sid $sid)) {
-        Show-Message -Text "« $n » est déjà dans la liste."
-        return
-    }
+    $name = if ($found.Count) { [string]$found[0].sAMAccountName } else { $n }
+    $groups = Select-WhitelistGroup -Title "Groupes où « $name » est autorisé :" -Selected @(Get-SelectedGroupKey | Select-Object -First 1)
+    if (-not $groups) { return }
+    $r = Add-WhitelistEntry -Name $name -Sid $sid -Groups $groups
+    if ($r -eq 'inchangé') { Show-Message -Text "« $name » est déjà autorisé dans ces groupes." ; return }
     $txtWhite.Clear()
     Update-StepState
 })
+
+$btnWhiteGroups.Add_Click({
+    $items = @($lvWhite.SelectedItems)
+    if (-not $items.Count) { Show-Message -Text 'Sélectionnez un ou plusieurs comptes dans la liste.'; return }
+    $title = if ($items.Count -eq 1) { "Groupes où « $($items[0].Text) » est autorisé :" } else { "Groupes où les $($items.Count) comptes sélectionnés sont autorisés :" }
+    $groups = Select-WhitelistGroup -Title $title -Selected @($items[0].Tag.Groups)
+    if (-not $groups) { return }
+    foreach ($item in $items) { Set-WhitelistItemGroups -Item $item -Groups $groups }
+    Update-StepState
+})
+$lvWhite.Add_DoubleClick({ $btnWhiteGroups.PerformClick() })
 $txtWhite.Add_KeyDown({ if ($_.KeyCode -eq 'Enter') { $btnWhiteAdd.PerformClick(); $_.SuppressKeyPress = $true } })
 
 $btnWhiteRemove.Add_Click({
@@ -428,17 +497,22 @@ $btnImport.Add_Click({
     try {
         $form.Cursor = 'WaitCursor'
         $added = @()
-        # Membres directs et imbriqués, Administrateur intégré excepté (toujours autorisé) ;
-        # les groupes imbriqués sont ajoutés aussi, pour autoriser l'imbrication
-        foreach ($gi in @(Get-AdagGroup -Key $keys)) {
-            foreach ($e in @(Get-AdagEffectiveMember -GroupInfo $gi)) {
+        # Membres directs et imbriqués, Administrateur intégré excepté (toujours autorisé) ; chaque compte est autorisé
+        # dans le groupe où il a été trouvé. Les groupes imbriqués sont ajoutés aussi, pour autoriser l'imbrication ;
+        # l'imbrication par défaut (Admins du domaine dans Administrateurs) n'a pas besoin de l'être.
+        $infos = @(Get-AdagGroup -Key $keys -WarningVariable importWarnings -WarningAction SilentlyContinue)
+        foreach ($gi in $infos) {
+            $noDescend = Get-AdagDefaultNesting -GroupInfo $infos -Key $gi.Key
+            foreach ($e in @(Get-AdagEffectiveMember -GroupInfo $gi -NoDescendSid $noDescend)) {
                 $m = $e.Member
-                if (-not $m.SamAccountName -or $m.Sid -like '*-500') { continue }
-                if (Add-WhitelistEntry -Name $m.SamAccountName -Sid $m.Sid) { $added += "$($m.SamAccountName)  (via $($e.Path))" }
+                if ($e.DefaultNesting -or -not $m.SamAccountName -or $m.Sid -like '*-500') { continue }
+                $r = Add-WhitelistEntry -Name $m.SamAccountName -Sid $m.Sid -Groups @($gi.Key)
+                if ($r -ne 'inchangé') { $added += "$($m.SamAccountName) : $($groupDefs[$gi.Key].Short)  (via $($e.Path))" }
             }
         }
         Update-StepState
-        $msg = if ($added.Count) { "$($added.Count) compte(s) ajouté(s) :`r`n" + ($added -join "`r`n") } else { 'Tous les membres actuels sont déjà dans la liste.' }
+        $msg = if ($added.Count) { "$($added.Count) autorisation(s) ajoutée(s) :`r`n" + ($added -join "`r`n") } else { 'Tous les membres actuels sont déjà autorisés.' }
+        if (@($importWarnings).Count) { $msg += "`r`n`r`n" + (@($importWarnings) -join "`r`n") }
         Show-Message -Text "$msg`r`n`r`nCliquez sur Enregistrer pour écrire whitelist.txt."
     }
     catch { Show-Message -Text "Import impossible : $($_.Exception.Message)" -Icon Error }
@@ -608,7 +682,7 @@ $lblBlocked = Add-Control -Parent $tabDeploy -Type Label -X 10 -Y 366 -Width 690
 $lblBlocked.ForeColor = 'Firebrick'
 
 $lblDeployHint = Add-Control -Parent $tabDeploy -Type Label -X 10 -Y 390 -Width 690 -Height 85 -Text (
-    "La tâche s'exécute en SYSTEM à chaque événement 4728 ou 4756 du journal Sécurité de ce DC, et toutes les heures. " +
+    "La tâche s'exécute en SYSTEM à chaque événement 4728, 4732 ou 4756 du journal Sécurité de ce DC, et toutes les heures. " +
     "Installez-la sur chaque contrôleur de domaine ; l'installation restreint les droits du dossier à SYSTEM et Administrateurs.`r`n" +
     "L'export contient la configuration et la liste blanche, jamais les secrets : après un import, ressaisissez le secret " +
     "à l'étape 3, puis Enregistrer.")
@@ -616,7 +690,7 @@ $lblDeployHint.ForeColor = 'DimGray'
 
 $btnInstall.Add_Click({
     if (-not $isAdmin) { Show-Message -Text 'Relancez le configurateur en tant qu''administrateur.' -Icon Warning; return }
-    if (-not $isDC -and -not (Confirm-Action -Text "$env:COMPUTERNAME n'est pas un contrôleur de domaine : les événements 4728/4756 n'y sont pas journalisés. Installer quand même ?")) { return }
+    if (-not $isDC -and -not (Confirm-Action -Text "$env:COMPUTERNAME n'est pas un contrôleur de domaine : les événements 4728/4732/4756 n'y sont pas journalisés. Installer quand même ?")) { return }
     Update-AuditState
     if ($script:AuditState.Enabled -eq $false -and -not (Confirm-Action -Text ("L'audit « Gestion des groupes de sécurité » n'est pas actif en succès sur $env:COMPUTERNAME : " +
         "la tâche ne se déclenchera qu'au contrôle horaire. Installer quand même ?"))) { return }
